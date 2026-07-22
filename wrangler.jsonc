@@ -21,6 +21,10 @@
 			"database_id": "8f940951-d2f9-431c-ba95-796bce7d6590"
 		}
 	],
+	"vars": {
+		"VAPID_PUBLIC_KEY": "BMuIyG8Sz8tS6Am3lBdaryOfbWQJ300djQQRhkFOCjGiBT7uiGTR51FiHBIruML8diYeGZ9jK5xC2fypS-iPdeo",
+		"VAPID_SUBJECT": "mailto:jack.maddocks@live.co.uk"
+	},
 	"compatibility_flags": [
 		"nodejs_compat"
 	]

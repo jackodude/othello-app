@@ -149,7 +149,8 @@
 
 .join-panel,
 .identity-panel,
-.invitation-panel {
+.invitation-panel,
+.notification-panel {
   width: min(100%, 26rem);
   display: flex;
   flex-direction: column;
@@ -164,6 +165,25 @@
   display: grid;
   grid-template-columns: 1fr auto;
   align-items: center;
+}
+
+.notification-panel {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+
+.notification-panel p {
+  margin: 0.2rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.notification-panel__message {
+  grid-column: 1 / -1;
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--text-secondary);
 }
 
 .identity-panel__summary {
@@ -542,6 +562,7 @@
   .game-controls,
   .identity-panel,
   .install-panel,
+  .notification-panel,
   .join-form__row,
   .invitation-box,
   .settings-panel__options {

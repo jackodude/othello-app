@@ -2,6 +2,41 @@
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
+## Push notification setup
+
+Web Push is optional. Normal game creation, joining, polling, and moves continue
+to work when VAPID settings are absent.
+
+Generate VAPID keys:
+
+```sh
+npx @pushforge/builder vapid
+```
+
+For local development, provide the public key, private JWK, and subject through
+Wrangler environment configuration. The private key must not be committed.
+
+```sh
+wrangler secret put VAPID_PRIVATE_KEY
+```
+
+Set non-secret public configuration for the Worker environment:
+
+```sh
+VAPID_PUBLIC_KEY=<public key from the generator>
+VAPID_SUBJECT=mailto:you@example.com
+```
+
+For production, set the private key as a Cloudflare secret:
+
+```sh
+wrangler secret put VAPID_PRIVATE_KEY
+```
+
+Configure `VAPID_PUBLIC_KEY` and `VAPID_SUBJECT` as Worker variables in the
+Cloudflare dashboard or Wrangler environment configuration. `VAPID_SUBJECT`
+must be a valid `mailto:` or HTTPS contact value.
+
 Currently, two official plugins are available:
 
 - [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)

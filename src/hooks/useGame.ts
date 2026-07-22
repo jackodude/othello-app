@@ -32,7 +32,11 @@ function playerTokenKey(joinCode: string): string {
 }
 
 function readStoredJoinCode(): string | null {
-  const storedCode = localStorage.getItem(SELECTED_JOIN_CODE_KEY);
+  const queryCode =
+    typeof window === 'undefined'
+      ? null
+      : new URLSearchParams(window.location.search).get('game');
+  const storedCode = queryCode || localStorage.getItem(SELECTED_JOIN_CODE_KEY);
   const normalizedCode = storedCode ? normalizeJoinCode(storedCode) : '';
 
   return normalizedCode || null;
@@ -485,6 +489,7 @@ export function useGame() {
     joinCode: game?.joinCode ?? selectedJoinCode,
     invitation: game?.invitation ?? null,
     playerColor: game?.playerColor ?? null,
+    playerToken,
     opponentJoined: game?.opponentJoined ?? false,
     isAuthenticated: Boolean(game && playerToken),
     isYourTurn:

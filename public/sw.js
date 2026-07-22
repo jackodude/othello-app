@@ -46,3 +46,38 @@ self.addEventListener('fetch', (event) => {
     );
   }
 });
+
+self.addEventListener('push', (event) => {
+  const payload = event.data?.json() ?? {};
+  const title = typeof payload.title === 'string' ? payload.title : 'Othello';
+
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: typeof payload.body === 'string' ? payload.body : 'Open your game.',
+      icon: typeof payload.icon === 'string' ? payload.icon : '/pwa-icon-192.png',
+      badge: typeof payload.badge === 'string' ? payload.badge : '/pwa-icon-192.png',
+      tag: typeof payload.tag === 'string' ? payload.tag : undefined,
+      data: payload.data && typeof payload.data === 'object' ? payload.data : {},
+    }),
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+
+  const targetUrl = new URL(event.notification.data?.url || '/', self.location.origin);
+
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
+        const clientUrl = new URL(client.url);
+        if (clientUrl.origin === targetUrl.origin && 'focus' in client) {
+          client.navigate(targetUrl.href);
+          return client.focus();
+        }
+      }
+
+      return self.clients.openWindow(targetUrl.href);
+    }),
+  );
+});

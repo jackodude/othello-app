@@ -1,4 +1,9 @@
 import {
+  buildPushHTTPRequest,
+  type PushSubscription as WebPushSubscription,
+} from '@pushforge/builder';
+
+import {
   applyMove,
   BOARD_SIZE,
   createInitialGameState,
@@ -27,6 +32,14 @@ interface MoveRequest {
 
 interface JoinRequest {
   readonly inviteToken: string;
+}
+
+interface PushSubscriptionRequest {
+  readonly endpoint: string;
+  readonly keys: {
+    readonly p256dh: string;
+    readonly auth: string;
+  };
 }
 
 interface GameRow {
@@ -70,12 +83,38 @@ interface StoredGame {
 
 interface WorkerEnv extends Env {
   readonly DB: D1Database;
+  readonly VAPID_PUBLIC_KEY?: string;
+  readonly VAPID_PRIVATE_KEY?: string;
+  readonly VAPID_SUBJECT?: string;
 }
 
 const JOIN_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const JOIN_CODE_LENGTH = 6;
 const MAX_JOIN_CODE_ATTEMPTS = 8;
 const TOKEN_BYTE_LENGTH = 32;
+const MAX_NOTIFICATION_ATTEMPTS = 2;
+
+type NotificationEventType = 'white_joined' | 'your_turn' | 'game_finished';
+
+interface NotificationEvent {
+  readonly eventType: NotificationEventType;
+  readonly recipientPlayerColor: Player;
+  readonly title: string;
+  readonly body: string;
+}
+
+interface PushSubscriptionRow {
+  readonly id: string;
+  readonly endpoint: string;
+  readonly p256dh: string;
+  readonly auth: string;
+}
+
+interface PushNotificationEventRow {
+  readonly id: string;
+  readonly delivery_state: 'pending' | 'sent' | 'failed';
+  readonly attempts: number;
+}
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return Response.json(body, init);
@@ -83,6 +122,10 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
 
 function errorResponse(status: number, message: string): Response {
   return jsonResponse({ error: message }, { status });
+}
+
+function isPushConfigured(env: WorkerEnv): boolean {
+  return Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY && env.VAPID_SUBJECT);
 }
 
 function toGameRecord(
@@ -339,6 +382,52 @@ async function parseJoinRequest(request: Request): Promise<JoinRequest | null> {
   return { inviteToken: body.inviteToken };
 }
 
+async function parsePushSubscriptionRequest(
+  request: Request,
+): Promise<PushSubscriptionRequest | null> {
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return null;
+  }
+
+  if (!isPlainObject(body) || typeof body.endpoint !== 'string') {
+    return null;
+  }
+
+  const keys = body.keys;
+  if (
+    !isPlainObject(keys) ||
+    typeof keys.p256dh !== 'string' ||
+    typeof keys.auth !== 'string'
+  ) {
+    return null;
+  }
+
+  try {
+    const endpoint = new URL(body.endpoint);
+    if (endpoint.protocol !== 'https:') {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  if (!body.endpoint || !keys.p256dh || !keys.auth) {
+    return null;
+  }
+
+  return {
+    endpoint: body.endpoint,
+    keys: {
+      p256dh: keys.p256dh,
+      auth: keys.auth,
+    },
+  };
+}
+
 async function getGameByJoinCode(
   db: D1Database,
   joinCode: string,
@@ -518,6 +607,306 @@ async function claimWhite(
   return (result.meta.changes ?? 0) > 0;
 }
 
+async function upsertPushSubscription(
+  db: D1Database,
+  game: StoredGame,
+  playerColor: Player,
+  subscription: PushSubscriptionRequest,
+): Promise<void> {
+  const now = new Date().toISOString();
+
+  await db
+    .prepare(
+      `INSERT INTO push_subscriptions (
+         id, game_id, player_color, endpoint, p256dh, auth, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(game_id, player_color, endpoint) DO UPDATE SET
+         p256dh = excluded.p256dh,
+         auth = excluded.auth,
+         updated_at = excluded.updated_at`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      game.id,
+      playerColor,
+      subscription.endpoint,
+      subscription.keys.p256dh,
+      subscription.keys.auth,
+      now,
+      now,
+    )
+    .run();
+}
+
+async function deletePushSubscription(
+  db: D1Database,
+  game: StoredGame,
+  playerColor: Player,
+  endpoint: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `DELETE FROM push_subscriptions
+       WHERE game_id = ? AND player_color = ? AND endpoint = ?`,
+    )
+    .bind(game.id, playerColor, endpoint)
+    .run();
+}
+
+export function deriveNotificationEvent({
+  previousGame,
+  updatedGame,
+  actorPlayerColor,
+  eventType,
+}: {
+  readonly previousGame: StoredGame;
+  readonly updatedGame: StoredGame;
+  readonly actorPlayerColor: Player;
+  readonly eventType: 'join' | 'move';
+}): NotificationEvent | null {
+  if (eventType === 'join') {
+    if (
+      actorPlayerColor === 'white' &&
+      !previousGame.whiteJoined &&
+      updatedGame.whiteJoined
+    ) {
+      return {
+        eventType: 'white_joined',
+        recipientPlayerColor: 'black',
+        title: 'White joined your Othello game',
+        body: 'The game is ready. It is your turn.',
+      };
+    }
+
+    return null;
+  }
+
+  if (updatedGame.state.status === 'finished') {
+    const recipientPlayerColor = actorPlayerColor === 'black' ? 'white' : 'black';
+    const winner = getGameResult(getScores(updatedGame.state.board));
+    const body =
+      winner === 'draw'
+        ? 'The game ended in a draw.'
+        : winner === recipientPlayerColor
+          ? 'You win.'
+          : 'You lose.';
+
+    return {
+      eventType: 'game_finished',
+      recipientPlayerColor,
+      title: 'Othello game finished',
+      body,
+    };
+  }
+
+  if (updatedGame.state.currentPlayer !== actorPlayerColor) {
+    return {
+      eventType: 'your_turn',
+      recipientPlayerColor: updatedGame.state.currentPlayer,
+      title: 'Your turn in Othello',
+      body: 'Your opponent made a move.',
+    };
+  }
+
+  return null;
+}
+
+async function createPendingNotificationEvent(
+  db: D1Database,
+  game: StoredGame,
+  notification: NotificationEvent,
+): Promise<string | null> {
+  const existingEvent = await db
+    .prepare(
+      `SELECT id, delivery_state, attempts
+       FROM push_notification_events
+       WHERE game_id = ? AND game_version = ? AND event_type = ?
+         AND recipient_player_color = ?`,
+    )
+    .bind(
+      game.id,
+      game.version,
+      notification.eventType,
+      notification.recipientPlayerColor,
+    )
+    .first<PushNotificationEventRow>();
+
+  if (existingEvent) {
+    if (
+      existingEvent.delivery_state !== 'failed' ||
+      existingEvent.attempts >= MAX_NOTIFICATION_ATTEMPTS
+    ) {
+      return null;
+    }
+
+    return existingEvent.id;
+  }
+
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+
+  try {
+    await db
+      .prepare(
+        `INSERT INTO push_notification_events (
+           id, game_id, game_version, event_type, recipient_player_color,
+           delivery_state, attempts, last_error, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        id,
+        game.id,
+        game.version,
+        notification.eventType,
+        notification.recipientPlayerColor,
+        'pending',
+        0,
+        null,
+        now,
+        now,
+      )
+      .run();
+  } catch {
+    return null;
+  }
+
+  return id;
+}
+
+async function listPushSubscriptions(
+  db: D1Database,
+  gameId: string,
+  playerColor: Player,
+): Promise<PushSubscriptionRow[]> {
+  const result = await db
+    .prepare(
+      `SELECT id, endpoint, p256dh, auth
+       FROM push_subscriptions
+       WHERE game_id = ? AND player_color = ?`,
+    )
+    .bind(gameId, playerColor)
+    .all<PushSubscriptionRow>();
+
+  return result.results ?? [];
+}
+
+async function updateNotificationDeliveryState(
+  db: D1Database,
+  eventId: string,
+  deliveryState: 'sent' | 'failed',
+  attempts: number,
+  lastError: string | null,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE push_notification_events
+       SET delivery_state = ?, attempts = ?, last_error = ?, updated_at = ?
+       WHERE id = ?`,
+    )
+    .bind(deliveryState, attempts, lastError, new Date().toISOString(), eventId)
+    .run();
+}
+
+async function removePermanentPushFailure(
+  db: D1Database,
+  subscriptionId: string,
+): Promise<void> {
+  await db
+    .prepare('DELETE FROM push_subscriptions WHERE id = ?')
+    .bind(subscriptionId)
+    .run();
+}
+
+export async function sendNotificationEvent(
+  db: D1Database,
+  env: WorkerEnv,
+  game: StoredGame,
+  notification: NotificationEvent,
+): Promise<void> {
+  if (!isPushConfigured(env)) {
+    return;
+  }
+
+  const eventId = await createPendingNotificationEvent(db, game, notification);
+  if (!eventId) {
+    return;
+  }
+
+  const subscriptions = await listPushSubscriptions(
+    db,
+    game.id,
+    notification.recipientPlayerColor,
+  );
+
+  if (subscriptions.length === 0) {
+    await updateNotificationDeliveryState(db, eventId, 'failed', 1, 'No subscriptions');
+    return;
+  }
+
+  let didSend = false;
+  let lastError: string | null = null;
+
+  for (const subscription of subscriptions) {
+    try {
+      const request = await buildPushHTTPRequest({
+        privateJWK: env.VAPID_PRIVATE_KEY!,
+        subscription: {
+          endpoint: subscription.endpoint,
+          keys: {
+            p256dh: subscription.p256dh,
+            auth: subscription.auth,
+          },
+        } satisfies WebPushSubscription,
+        message: {
+          payload: {
+            title: notification.title,
+            body: notification.body,
+            icon: '/pwa-icon-192.png',
+            badge: '/pwa-icon-192.png',
+            tag: `${game.id}-${game.version}-${notification.eventType}`,
+            data: {
+              url: `/?game=${encodeURIComponent(game.joinCode)}`,
+              joinCode: game.joinCode,
+            },
+          },
+          adminContact: env.VAPID_SUBJECT!,
+          options: {
+            ttl: 60 * 60,
+            urgency: 'normal',
+            topic: `${game.id}-${game.version}-${notification.eventType}`,
+          },
+        },
+      });
+
+      const response = await fetch(request.endpoint, {
+        method: 'POST',
+        headers: request.headers,
+        body: request.body,
+      });
+
+      if (response.ok || response.status === 201 || response.status === 202) {
+        didSend = true;
+        continue;
+      }
+
+      lastError = `Push service returned ${response.status}`;
+      if (response.status === 404 || response.status === 410) {
+        await removePermanentPushFailure(db, subscription.id);
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : 'Push delivery failed';
+    }
+  }
+
+  await updateNotificationDeliveryState(
+    db,
+    eventId,
+    didSend ? 'sent' : 'failed',
+    Math.min(MAX_NOTIFICATION_ATTEMPTS, 1),
+    didSend ? null : lastError,
+  );
+}
+
 async function persistMove(
   db: D1Database,
   game: StoredGame,
@@ -563,6 +952,8 @@ async function persistMove(
 async function handleJoin(
   request: Request,
   db: D1Database,
+  env: WorkerEnv,
+  ctx: ExecutionContext,
   joinCode: string,
 ): Promise<Response> {
   const joinRequest = await parseJoinRequest(request);
@@ -596,6 +987,16 @@ async function handleJoin(
     return errorResponse(404, 'Game not found');
   }
 
+  const notification = deriveNotificationEvent({
+    previousGame: game,
+    updatedGame,
+    actorPlayerColor: 'white',
+    eventType: 'join',
+  });
+  if (notification) {
+    ctx.waitUntil(sendNotificationEvent(db, env, updatedGame, notification));
+  }
+
   return jsonResponse(
     toGameRecord(updatedGame, 'white', { playerToken: whiteToken }),
   );
@@ -604,6 +1005,8 @@ async function handleJoin(
 async function handleMove(
   request: Request,
   db: D1Database,
+  env: WorkerEnv,
+  ctx: ExecutionContext,
   joinCode: string,
 ): Promise<Response> {
   const moveRequest = await parseMoveRequest(request);
@@ -644,13 +1047,73 @@ async function handleMove(
     return errorResponse(404, 'Game not found');
   }
 
+  const notification = deriveNotificationEvent({
+    previousGame: game,
+    updatedGame: persistedGame,
+    actorPlayerColor: playerColor,
+    eventType: 'move',
+  });
+  if (notification) {
+    ctx.waitUntil(sendNotificationEvent(db, env, persistedGame, notification));
+  }
+
   return jsonResponse(toGameRecord(persistedGame, playerColor));
 }
 
+async function handleSubscribe(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<Response> {
+  const subscription = await parsePushSubscriptionRequest(request);
+  if (!subscription) {
+    return errorResponse(400, 'Malformed push subscription');
+  }
+
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  await upsertPushSubscription(
+    db,
+    authResult.game,
+    authResult.playerColor,
+    subscription,
+  );
+
+  return jsonResponse({ enabled: true });
+}
+
+async function handleUnsubscribe(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<Response> {
+  const subscription = await parsePushSubscriptionRequest(request);
+  if (!subscription) {
+    return errorResponse(400, 'Malformed push subscription');
+  }
+
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  await deletePushSubscription(
+    db,
+    authResult.game,
+    authResult.playerColor,
+    subscription.endpoint,
+  );
+
+  return jsonResponse({ enabled: false });
+}
+
 function parseGamePath(pathname: string):
-  | { readonly code: string; readonly action: 'read' | 'move' | 'join' }
+  | { readonly code: string; readonly action: 'read' | 'move' | 'join' | 'push' }
   | null {
-  const match = /^\/api\/games\/([^/]+)(?:\/(moves|join))?$/.exec(pathname);
+  const match = /^\/api\/games\/([^/]+)(?:\/(moves|join|push-subscriptions))?$/.exec(pathname);
   if (!match) {
     return null;
   }
@@ -658,15 +1121,30 @@ function parseGamePath(pathname: string):
   const suffix = match[2];
   return {
     code: decodeURIComponent(match[1]),
-    action: suffix === 'moves' ? 'move' : suffix === 'join' ? 'join' : 'read',
+    action:
+      suffix === 'moves'
+        ? 'move'
+        : suffix === 'join'
+          ? 'join'
+          : suffix === 'push-subscriptions'
+            ? 'push'
+            : 'read',
   };
 }
 
 async function routeApiRequest(
   request: Request,
   env: WorkerEnv,
+  ctx: ExecutionContext,
   url: URL,
 ): Promise<Response> {
+  if (url.pathname === '/api/push/public-key' && request.method === 'GET') {
+    return jsonResponse({
+      enabled: isPushConfigured(env),
+      publicKey: env.VAPID_PUBLIC_KEY ?? null,
+    });
+  }
+
   if (url.pathname === '/api/games' && request.method === 'POST') {
     const game = await createGame(env.DB);
     if (!game) {
@@ -678,7 +1156,7 @@ async function routeApiRequest(
 
   const gamePath = parseGamePath(url.pathname);
   if (gamePath?.action === 'join' && request.method === 'POST') {
-    return handleJoin(request, env.DB, gamePath.code);
+    return handleJoin(request, env.DB, env, ctx, gamePath.code);
   }
 
   if (gamePath?.action === 'read' && request.method === 'GET') {
@@ -691,18 +1169,30 @@ async function routeApiRequest(
   }
 
   if (gamePath?.action === 'move' && request.method === 'POST') {
-    return handleMove(request, env.DB, gamePath.code);
+    return handleMove(request, env.DB, env, ctx, gamePath.code);
+  }
+
+  if (gamePath?.action === 'push' && request.method === 'POST') {
+    if (!isPushConfigured(env)) {
+      return errorResponse(503, 'Push notifications are not configured');
+    }
+
+    return handleSubscribe(request, env.DB, gamePath.code);
+  }
+
+  if (gamePath?.action === 'push' && request.method === 'DELETE') {
+    return handleUnsubscribe(request, env.DB, gamePath.code);
   }
 
   return errorResponse(404, 'Not found');
 }
 
 export default {
-  fetch(request, env) {
+  fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname.startsWith('/api/')) {
-      return routeApiRequest(request, env, url);
+      return routeApiRequest(request, env, ctx, url);
     }
 
     return new Response(null, { status: 404 });

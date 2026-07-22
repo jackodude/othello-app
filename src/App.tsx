@@ -16,6 +16,15 @@ import {
   recordInstallDismissal,
   shouldShowIosInstallGuidance,
 } from './hooks/installPrompt';
+import {
+  getPushPermissionState,
+  getStoredPushEndpoint,
+  isPushSupported,
+  removeStoredPushEndpoint,
+  storePushEndpoint,
+  urlBase64ToArrayBuffer,
+  type PushPermissionState,
+} from './hooks/pushNotifications';
 import { getRelativeStatusMessage } from './hooks/gamePresentation';
 import { shouldShowInvitationPanel, shouldShowLegalMoves } from './hooks/gameUiState';
 import { useGame } from './hooks/useGame';
@@ -31,6 +40,7 @@ function App() {
     joinCode,
     invitation,
     playerColor,
+    playerToken,
     opponentJoined,
     isAuthenticated,
     isYourTurn,
@@ -71,6 +81,16 @@ function App() {
 
     return navigator.onLine;
   });
+  const [notificationPermission, setNotificationPermission] =
+    useState<NotificationPermission>(() => {
+      if (typeof Notification === 'undefined') {
+        return 'default';
+      }
+
+      return Notification.permission;
+    });
+  const [isNotificationBusy, setIsNotificationBusy] = useState(false);
+  const [notificationMessage, setNotificationMessage] = useState<string | null>(null);
   const [preferences, setPreferences] = useState(() => {
     if (typeof window === 'undefined') {
       return DEFAULT_GAME_PREFERENCES;
@@ -197,6 +217,128 @@ function App() {
         isStandalone,
       })
     : false;
+  const storedPushEndpoint =
+    typeof window === 'undefined'
+      ? null
+      : getStoredPushEndpoint(window.localStorage, joinCode ?? null);
+  const pushState: PushPermissionState = getPushPermissionState({
+    isSupported: typeof window !== 'undefined' && isPushSupported(),
+    permission: notificationPermission,
+    hasStoredEndpoint: Boolean(storedPushEndpoint),
+  });
+
+  async function readPushConfig(): Promise<string | null> {
+    const response = await fetch('/api/push/public-key');
+    if (!response.ok) {
+      return null;
+    }
+
+    const body = (await response.json()) as {
+      readonly enabled?: boolean;
+      readonly publicKey?: string | null;
+    };
+
+    return body.enabled && body.publicKey ? body.publicKey : null;
+  }
+
+  async function handleEnableNotifications() {
+    if (!joinCode || !playerToken || !isPushSupported()) {
+      return;
+    }
+
+    setIsNotificationBusy(true);
+    setNotificationMessage(null);
+
+    try {
+      const publicKey = await readPushConfig();
+      if (!publicKey) {
+        setNotificationMessage('Notifications are not configured on this server.');
+        return;
+      }
+
+      const permission = await Notification.requestPermission();
+      setNotificationPermission(permission);
+      if (permission !== 'granted') {
+        setNotificationMessage('Notifications are blocked for this browser.');
+        return;
+      }
+
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToArrayBuffer(publicKey),
+      });
+
+      const response = await fetch(
+        `/api/games/${encodeURIComponent(joinCode)}/push-subscriptions`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${playerToken}`,
+          },
+          body: JSON.stringify(subscription.toJSON()),
+        },
+      );
+
+      if (!response.ok) {
+        await subscription.unsubscribe();
+        setNotificationMessage('Unable to enable notifications.');
+        return;
+      }
+
+      storePushEndpoint(window.localStorage, joinCode, subscription.endpoint);
+      setNotificationMessage('Notifications enabled for this game.');
+    } catch {
+      setNotificationMessage('Unable to enable notifications.');
+    } finally {
+      setIsNotificationBusy(false);
+    }
+  }
+
+  async function handleDisableNotifications() {
+    if (!joinCode || !playerToken || !isPushSupported()) {
+      return;
+    }
+
+    setIsNotificationBusy(true);
+    setNotificationMessage(null);
+
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) {
+        await fetch(`/api/games/${encodeURIComponent(joinCode)}/push-subscriptions`, {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${playerToken}`,
+          },
+          body: JSON.stringify(subscription.toJSON()),
+        });
+        await subscription.unsubscribe();
+      } else if (storedPushEndpoint) {
+        await fetch(`/api/games/${encodeURIComponent(joinCode)}/push-subscriptions`, {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${playerToken}`,
+          },
+          body: JSON.stringify({
+            endpoint: storedPushEndpoint,
+            keys: { p256dh: 'unknown', auth: 'unknown' },
+          }),
+        });
+      }
+
+      removeStoredPushEndpoint(window.localStorage, joinCode);
+      setNotificationMessage('Notifications disabled for this game.');
+    } catch {
+      setNotificationMessage('Unable to disable notifications.');
+    } finally {
+      setIsNotificationBusy(false);
+    }
+  }
 
   return (
     <main className="app">
@@ -273,6 +415,47 @@ function App() {
         <div className="offline-warning" role="status">
           App shell is available offline. Live games need an internet connection.
         </div>
+      )}
+
+      {isAuthenticated && hasSelectedGame && (
+        <section className="notification-panel" aria-label="Push notifications">
+          <div>
+            <strong>Notifications</strong>
+            <p>
+              {pushState === 'unsupported'
+                ? 'This browser does not support web push notifications.'
+                : pushState === 'blocked'
+                  ? 'Notifications are blocked in this browser.'
+                  : pushState === 'enabled'
+                    ? 'Enabled for opponent moves and game updates.'
+                    : 'Get notified when it is your turn.'}
+            </p>
+          </div>
+          {pushState === 'enabled' ? (
+            <button
+              type="button"
+              className="load-game-button"
+              disabled={isNotificationBusy}
+              onClick={() => void handleDisableNotifications()}
+            >
+              Disable
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="load-game-button"
+              disabled={isNotificationBusy || pushState === 'unsupported' || pushState === 'blocked'}
+              onClick={() => void handleEnableNotifications()}
+            >
+              Enable
+            </button>
+          )}
+          {notificationMessage && (
+            <span className="notification-panel__message" role="status">
+              {notificationMessage}
+            </span>
+          )}
+        </section>
       )}
 
       {showGameSelection && (
