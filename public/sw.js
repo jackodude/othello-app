@@ -52,13 +52,34 @@ self.addEventListener('push', (event) => {
   const title = typeof payload.title === 'string' ? payload.title : 'Othello';
 
   event.waitUntil(
-    self.registration.showNotification(title, {
-      body: typeof payload.body === 'string' ? payload.body : 'Open your game.',
-      icon: typeof payload.icon === 'string' ? payload.icon : '/pwa-icon-192.png',
-      badge: typeof payload.badge === 'string' ? payload.badge : '/pwa-icon-192.png',
-      tag: typeof payload.tag === 'string' ? payload.tag : undefined,
-      data: payload.data && typeof payload.data === 'object' ? payload.data : {},
-    }),
+    self.clients
+      .matchAll({ type: 'window', includeUncontrolled: true })
+      .then((clients) => {
+        const hasVisibleWindow = clients.some(
+          (client) => client.visibilityState === 'visible',
+        );
+
+        if (hasVisibleWindow) {
+          return undefined;
+        }
+
+        return self.registration.showNotification(title, {
+          body: typeof payload.body === 'string' ? payload.body : 'Open your game.',
+          icon: typeof payload.icon === 'string' ? payload.icon : '/pwa-icon-192.png',
+          badge: typeof payload.badge === 'string' ? payload.badge : '/pwa-icon-192.png',
+          tag: typeof payload.tag === 'string' ? payload.tag : undefined,
+          data: payload.data && typeof payload.data === 'object' ? payload.data : {},
+        });
+      })
+      .catch(() =>
+        self.registration.showNotification(title, {
+          body: typeof payload.body === 'string' ? payload.body : 'Open your game.',
+          icon: typeof payload.icon === 'string' ? payload.icon : '/pwa-icon-192.png',
+          badge: typeof payload.badge === 'string' ? payload.badge : '/pwa-icon-192.png',
+          tag: typeof payload.tag === 'string' ? payload.tag : undefined,
+          data: payload.data && typeof payload.data === 'object' ? payload.data : {},
+        }),
+      ),
   );
 });
 
