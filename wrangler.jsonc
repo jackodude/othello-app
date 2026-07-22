@@ -14,6 +14,13 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "othello-app-db",
+			"database_id": "00000000-0000-0000-0000-000000000000"
+		}
+	],
 	"compatibility_flags": [
 		"nodejs_compat"
 	]

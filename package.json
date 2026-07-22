@@ -10,6 +10,8 @@
     "test": "vitest run",
     "preview": "npm run build && vite preview",
     "deploy": "npm run build && wrangler deploy",
+    "d1:migrations:local": "wrangler d1 migrations apply othello-app-db --local",
+    "d1:migrations:remote": "wrangler d1 migrations apply othello-app-db --remote",
     "cf-typegen": "wrangler types"
   },
   "dependencies": {
