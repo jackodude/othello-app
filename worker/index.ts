@@ -10,6 +10,7 @@ import type { Board, Cell, GameResult, GameState, Player, Position } from '../sr
 
 interface GameRecord {
   readonly id: string;
+  readonly joinCode: string;
   readonly state: GameState;
   readonly version: number;
 }
@@ -21,22 +22,23 @@ interface MoveRequest {
 }
 
 interface GameRow {
-  readonly singleton_key: string;
   readonly id: string;
+  readonly join_code: string;
   readonly board_json: string;
   readonly current_player: string;
   readonly status: string;
   readonly winner: string | null;
   readonly black_score: number;
   readonly white_score: number;
-  readonly version: number;
   readonly consecutive_passes: number;
+  readonly version: number;
   readonly created_at: string;
   readonly updated_at: string;
 }
 
 interface StoredGame {
   readonly id: string;
+  readonly joinCode: string;
   readonly state: GameState;
   readonly version: number;
   readonly winner: GameResult | null;
@@ -50,7 +52,9 @@ interface WorkerEnv extends Env {
   readonly DB: D1Database;
 }
 
-const CURRENT_GAME_KEY = 'current';
+const JOIN_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const JOIN_CODE_LENGTH = 6;
+const MAX_JOIN_CODE_ATTEMPTS = 8;
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return Response.json(body, init);
@@ -63,6 +67,7 @@ function errorResponse(status: number, message: string): Response {
 function toGameRecord(game: StoredGame): GameRecord {
   return {
     id: game.id,
+    joinCode: game.joinCode,
     state: game.state,
     version: game.version,
   };
@@ -82,6 +87,26 @@ function isGameStatus(value: unknown): value is GameState['status'] {
 
 function isGameResult(value: unknown): value is GameResult {
   return value === 'black' || value === 'white' || value === 'draw';
+}
+
+function normalizeJoinCode(code: string): string {
+  return code.trim().toUpperCase();
+}
+
+function isValidJoinCode(code: string): boolean {
+  return (
+    code.length === JOIN_CODE_LENGTH &&
+    [...code].every((character) => JOIN_CODE_ALPHABET.includes(character))
+  );
+}
+
+function generateJoinCode(): string {
+  const values = new Uint32Array(JOIN_CODE_LENGTH);
+  crypto.getRandomValues(values);
+
+  return [...values]
+    .map((value) => JOIN_CODE_ALPHABET[value % JOIN_CODE_ALPHABET.length])
+    .join('');
 }
 
 function parseBoard(value: string): Board | null {
@@ -121,8 +146,9 @@ function parseBoard(value: string): Board | null {
 
 function rowToStoredGame(row: GameRow): StoredGame | null {
   if (
-    row.singleton_key !== CURRENT_GAME_KEY ||
     typeof row.id !== 'string' ||
+    typeof row.join_code !== 'string' ||
+    !isValidJoinCode(row.join_code) ||
     !isPlayer(row.current_player) ||
     !isGameStatus(row.status) ||
     typeof row.version !== 'number' ||
@@ -169,6 +195,7 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
 
   return {
     id: row.id,
+    joinCode: row.join_code,
     state,
     version: row.version,
     winner,
@@ -209,7 +236,7 @@ async function parseMoveRequest(request: Request): Promise<MoveRequest | null> {
 
   const row = body.row;
   const col = body.col;
-  const expectedVersion = body.expectedVersion ?? body.version;
+  const expectedVersion = body.expectedVersion;
 
   if (
     typeof row !== 'number' ||
@@ -225,16 +252,25 @@ async function parseMoveRequest(request: Request): Promise<MoveRequest | null> {
   return { row, col, expectedVersion };
 }
 
-async function getCurrentGame(db: D1Database): Promise<StoredGame | null> {
+async function getGameByJoinCode(
+  db: D1Database,
+  joinCode: string,
+): Promise<StoredGame | null> {
+  const normalizedCode = normalizeJoinCode(joinCode);
+
+  if (!isValidJoinCode(normalizedCode)) {
+    return null;
+  }
+
   const row = await db
     .prepare(
-      `SELECT singleton_key, id, board_json, current_player, status, winner,
-              black_score, white_score, version, consecutive_passes,
+      `SELECT id, join_code, board_json, current_player, status, winner,
+              black_score, white_score, consecutive_passes, version,
               created_at, updated_at
-       FROM current_game
-       WHERE singleton_key = ?`,
+       FROM games
+       WHERE join_code = ?`,
     )
-    .bind(CURRENT_GAME_KEY)
+    .bind(normalizedCode)
     .first<GameRow>();
 
   if (!row) {
@@ -244,47 +280,61 @@ async function getCurrentGame(db: D1Database): Promise<StoredGame | null> {
   return rowToStoredGame(row);
 }
 
-async function createGame(db: D1Database): Promise<StoredGame> {
-  const state = createInitialGameState();
+async function insertGame(
+  db: D1Database,
+  id: string,
+  joinCode: string,
+  state: GameState,
+): Promise<boolean> {
   const fields = gameStateToStorageFields(state);
   const now = new Date().toISOString();
-  const id = crypto.randomUUID();
   const version = 1;
 
-  await db
-    .prepare(
-      `INSERT OR REPLACE INTO current_game (
-        singleton_key, id, board_json, current_player, status, winner,
-        black_score, white_score, version, consecutive_passes,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(
-      CURRENT_GAME_KEY,
-      id,
-      fields.boardJson,
-      fields.currentPlayer,
-      fields.status,
-      fields.winner,
-      fields.blackScore,
-      fields.whiteScore,
-      version,
-      fields.consecutivePasses,
-      now,
-      now,
-    )
-    .run();
+  try {
+    await db
+      .prepare(
+        `INSERT INTO games (
+          id, join_code, board_json, current_player, status, winner,
+          black_score, white_score, consecutive_passes, version,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        id,
+        joinCode,
+        fields.boardJson,
+        fields.currentPlayer,
+        fields.status,
+        fields.winner,
+        fields.blackScore,
+        fields.whiteScore,
+        fields.consecutivePasses,
+        version,
+        now,
+        now,
+      )
+      .run();
+  } catch {
+    return false;
+  }
 
-  return {
-    id,
-    state,
-    version,
-    winner: fields.winner,
-    blackScore: fields.blackScore,
-    whiteScore: fields.whiteScore,
-    createdAt: now,
-    updatedAt: now,
-  };
+  return true;
+}
+
+async function createGame(db: D1Database): Promise<StoredGame | null> {
+  const state = createInitialGameState();
+
+  for (let attempt = 0; attempt < MAX_JOIN_CODE_ATTEMPTS; attempt += 1) {
+    const id = crypto.randomUUID();
+    const joinCode = generateJoinCode();
+    const didInsert = await insertGame(db, id, joinCode, state);
+
+    if (didInsert) {
+      return getGameByJoinCode(db, joinCode);
+    }
+  }
+
+  return null;
 }
 
 async function persistMove(
@@ -298,17 +348,17 @@ async function persistMove(
 
   const result = await db
     .prepare(
-      `UPDATE current_game
+      `UPDATE games
        SET board_json = ?,
            current_player = ?,
            status = ?,
            winner = ?,
            black_score = ?,
            white_score = ?,
-           version = ?,
            consecutive_passes = ?,
+           version = ?,
            updated_at = ?
-       WHERE singleton_key = ? AND version = ?`,
+       WHERE id = ? AND join_code = ? AND version = ?`,
     )
     .bind(
       fields.boardJson,
@@ -317,10 +367,11 @@ async function persistMove(
       fields.winner,
       fields.blackScore,
       fields.whiteScore,
-      nextVersion,
       fields.consecutivePasses,
+      nextVersion,
       updatedAt,
-      CURRENT_GAME_KEY,
+      game.id,
+      game.joinCode,
       game.version,
     )
     .run();
@@ -328,40 +379,57 @@ async function persistMove(
   return (result.meta.changes ?? 0) > 0;
 }
 
-async function handleMove(request: Request, db: D1Database): Promise<Response> {
-  const currentGame = await getCurrentGame(db);
-
+async function handleMove(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<Response> {
   const moveRequest = await parseMoveRequest(request);
   if (!moveRequest) {
     return errorResponse(400, 'Malformed move request');
   }
 
-  if (!currentGame) {
-    return errorResponse(404, 'No current game');
+  const game = await getGameByJoinCode(db, joinCode);
+  if (!game) {
+    return errorResponse(404, 'Game not found');
   }
 
-  if (moveRequest.expectedVersion !== currentGame.version) {
+  if (moveRequest.expectedVersion !== game.version) {
     return errorResponse(409, 'Stale game version');
   }
 
   const move: Position = { row: moveRequest.row, col: moveRequest.col };
-  const nextState = applyMove(currentGame.state, move);
+  const nextState = applyMove(game.state, move);
 
   if (!nextState) {
     return errorResponse(422, 'Illegal move');
   }
 
-  const didPersist = await persistMove(db, currentGame, nextState);
+  const didPersist = await persistMove(db, game, nextState);
   if (!didPersist) {
     return errorResponse(409, 'Stale game version');
   }
 
-  const persistedGame = await getCurrentGame(db);
+  const persistedGame = await getGameByJoinCode(db, game.joinCode);
   if (!persistedGame) {
-    return errorResponse(404, 'No current game');
+    return errorResponse(404, 'Game not found');
   }
 
   return jsonResponse(toGameRecord(persistedGame));
+}
+
+function parseGamePath(pathname: string):
+  | { readonly code: string; readonly action: 'read' | 'move' }
+  | null {
+  const match = /^\/api\/games\/([^/]+)(?:\/moves)?$/.exec(pathname);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    code: decodeURIComponent(match[1]),
+    action: pathname.endsWith('/moves') ? 'move' : 'read',
+  };
 }
 
 async function routeApiRequest(
@@ -370,20 +438,26 @@ async function routeApiRequest(
   url: URL,
 ): Promise<Response> {
   if (url.pathname === '/api/games' && request.method === 'POST') {
-    return jsonResponse(toGameRecord(await createGame(env.DB)), { status: 201 });
-  }
-
-  if (url.pathname === '/api/games/current' && request.method === 'GET') {
-    const currentGame = await getCurrentGame(env.DB);
-    if (!currentGame) {
-      return errorResponse(404, 'No current game');
+    const game = await createGame(env.DB);
+    if (!game) {
+      return errorResponse(500, 'Unable to create game');
     }
 
-    return jsonResponse(toGameRecord(currentGame));
+    return jsonResponse(toGameRecord(game), { status: 201 });
   }
 
-  if (url.pathname === '/api/games/current/moves' && request.method === 'POST') {
-    return handleMove(request, env.DB);
+  const gamePath = parseGamePath(url.pathname);
+  if (gamePath?.action === 'read' && request.method === 'GET') {
+    const game = await getGameByJoinCode(env.DB, gamePath.code);
+    if (!game) {
+      return errorResponse(404, 'Game not found');
+    }
+
+    return jsonResponse(toGameRecord(game));
+  }
+
+  if (gamePath?.action === 'move' && request.method === 'POST') {
+    return handleMove(request, env.DB, gamePath.code);
   }
 
   return errorResponse(404, 'Not found');

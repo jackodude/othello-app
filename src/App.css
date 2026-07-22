@@ -33,6 +33,58 @@
   gap: 0.75rem;
 }
 
+.game-controls {
+  width: min(100%, 26rem);
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: end;
+  gap: 0.75rem;
+}
+
+.join-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.join-form__label {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.join-form__row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.5rem;
+}
+
+.join-form__input {
+  min-width: 0;
+  height: 2.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0 0.75rem;
+  background: var(--surface);
+  color: var(--text-primary);
+  font: inherit;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.load-game-button {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0 0.85rem;
+  font: inherit;
+  font-weight: 700;
+  color: var(--text-primary);
+  background: var(--surface-elevated);
+  cursor: pointer;
+}
+
 .connection-status {
   width: min(100%, 26rem);
   text-align: center;
@@ -50,6 +102,44 @@
   background: #fee2e2;
   font-size: 0.9rem;
   text-align: center;
+}
+
+.error-message--not-found {
+  border-color: #f97316;
+  color: #9a3412;
+  background: #ffedd5;
+}
+
+.sync-warning {
+  width: min(100%, 26rem);
+  margin: 0;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid #facc15;
+  border-radius: 0.5rem;
+  color: #854d0e;
+  background: #fef9c3;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.empty-state {
+  width: min(100%, 26rem);
+  padding: 1.5rem;
+  border: 1px dashed var(--border);
+  border-radius: 0.75rem;
+  text-align: center;
+  color: var(--text-secondary);
+  background: var(--surface-elevated);
+}
+
+.empty-state h2 {
+  margin: 0 0 0.35rem;
+  font-size: 1.15rem;
+  color: var(--text-primary);
+}
+
+.empty-state p {
+  margin: 0;
 }
 
 .scoreboard {
@@ -212,7 +302,8 @@
   appearance: none;
   border: none;
   border-radius: 0.65rem;
-  padding: 0.75rem 1.5rem;
+  min-height: 2.75rem;
+  padding: 0.75rem 1rem;
   font-size: 1rem;
   font-weight: 600;
   font-family: inherit;
@@ -235,7 +326,9 @@
   transform: translateY(1px);
 }
 
-.new-game-button:disabled {
+.new-game-button:disabled,
+.load-game-button:disabled,
+.join-form__input:disabled {
   cursor: default;
   filter: grayscale(0.3);
   opacity: 0.7;
@@ -250,6 +343,12 @@
   to {
     transform: scale(1);
     opacity: 1;
+  }
+}
+
+@media (max-width: 420px) {
+  .game-controls {
+    grid-template-columns: 1fr;
   }
 }
 
