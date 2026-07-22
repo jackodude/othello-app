@@ -42,6 +42,18 @@ describe('game preferences', () => {
     expect(loadGamePreferences(storage)).toEqual(preferences);
   });
 
+  it('keeps an existing saved last-move highlight preference', () => {
+    expect(
+      parseGamePreferences(
+        JSON.stringify({
+          highlightLastMove: true,
+          animateDiscChanges: true,
+          showLegalMoveIndicators: true,
+        }),
+      ).highlightLastMove,
+    ).toBe(true);
+  });
+
   it('falls back safely when stored data is invalid', () => {
     expect(parseGamePreferences('not json')).toEqual(DEFAULT_GAME_PREFERENCES);
     expect(parseGamePreferences(JSON.stringify({ highlightLastMove: 'no' }))).toEqual(

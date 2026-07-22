@@ -7,7 +7,7 @@ export interface GamePreferences {
 export const GAME_PREFERENCES_STORAGE_KEY = 'othello.gamePreferences';
 
 export const DEFAULT_GAME_PREFERENCES: GamePreferences = {
-  highlightLastMove: true,
+  highlightLastMove: false,
   animateDiscChanges: true,
   showLegalMoveIndicators: true,
 };
