@@ -1,4 +1,5 @@
 import type { Cell, Player, Position } from '../game';
+import { isPositionListed } from '../hooks/gamePresentation';
 
 interface BoardProps {
   board: readonly (readonly Cell[])[];
@@ -7,6 +8,9 @@ interface BoardProps {
   onCellClick: (position: Position) => void;
   disabled: boolean;
   showLegalMoves: boolean;
+  showLegalMoveIndicators: boolean;
+  recentPositions: readonly Position[];
+  animateChanges: boolean;
 }
 
 function isLegalMoveAt(
@@ -24,15 +28,22 @@ export function Board({
   onCellClick,
   disabled,
   showLegalMoves,
+  showLegalMoveIndicators,
+  recentPositions,
+  animateChanges,
 }: BoardProps) {
   return (
     <div className="board" role="grid" aria-label="Othello board">
       {board.map((row, rowIndex) =>
         row.map((cell, colIndex) => {
-          const isLegal = showLegalMoves && isLegalMoveAt(legalMoves, rowIndex, colIndex);
+          const isPlayableLegalMove =
+            showLegalMoves && isLegalMoveAt(legalMoves, rowIndex, colIndex);
+          const shouldShowLegalHint =
+            showLegalMoveIndicators && isPlayableLegalMove;
+          const isRecent = isPositionListed(recentPositions, rowIndex, colIndex);
           const cellLabel = cell
-            ? `${cell} disc`
-            : isLegal
+            ? `${cell} disc${isRecent ? ', changed on the last move' : ''}`
+            : isPlayableLegalMove
               ? `Empty square, legal move for ${currentPlayer}`
               : 'Empty square';
 
@@ -43,17 +54,32 @@ export function Board({
               className={[
                 'cell',
                 cell ? `cell--${cell}` : '',
-                isLegal ? 'cell--legal' : '',
+                isPlayableLegalMove ? 'cell--legal' : '',
+                shouldShowLegalHint ? 'cell--hinted' : '',
+                isRecent ? 'cell--recent' : '',
+                animateChanges ? 'cell--animated' : '',
               ]
                 .filter(Boolean)
                 .join(' ')}
               role="gridcell"
               aria-label={cellLabel}
-              disabled={disabled || !isLegal}
+              disabled={disabled || !isPlayableLegalMove}
               onClick={() => onCellClick({ row: rowIndex, col: colIndex })}
             >
-              {cell && <span className={`disc disc--${cell}`} aria-hidden="true" />}
-              {!cell && isLegal && (
+              {cell && (
+                <span
+                  className={[
+                    'disc',
+                    `disc--${cell}`,
+                    isRecent ? 'disc--recent' : '',
+                    animateChanges ? 'disc--animated' : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
+                  aria-hidden="true"
+                />
+              )}
+              {!cell && shouldShowLegalHint && (
                 <span
                   className={`hint hint--${currentPlayer}`}
                   aria-hidden="true"

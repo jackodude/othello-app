@@ -2,10 +2,12 @@ import type { GameResult, Player, Scores } from '../game';
 
 interface GameStatusProps {
   currentPlayer: Player;
+  playerColor: Player | null;
   scores: Scores;
   isFinished: boolean;
   result: GameResult | null;
   consecutivePasses: number;
+  statusMessage: string;
 }
 
 function formatPlayerName(player: Player): string {
@@ -22,21 +24,31 @@ function formatResult(result: GameResult): string {
 
 export function GameStatus({
   currentPlayer,
+  playerColor,
   scores,
   isFinished,
   result,
   consecutivePasses,
+  statusMessage,
 }: GameStatusProps) {
-  const statusMessage = isFinished
+  const absoluteStatus = isFinished
     ? result
       ? formatResult(result)
       : 'Game over'
     : consecutivePasses > 0
-      ? `${formatPlayerName(currentPlayer)} to move (opponent passed)`
+      ? `${formatPlayerName(currentPlayer)} to move after a pass`
       : `${formatPlayerName(currentPlayer)} to move`;
 
   return (
     <section className="status" aria-live="polite">
+      <div className="status__headline">
+        <span className="status__message">{statusMessage}</span>
+        {playerColor && (
+          <span className="status__identity">
+            Playing as {formatPlayerName(playerColor)}
+          </span>
+        )}
+      </div>
       <div className="scoreboard">
         <div className="score score--black">
           <span className="score__disc" aria-hidden="true" />
@@ -50,7 +62,7 @@ export function GameStatus({
         </div>
       </div>
       <p className={`turn turn--${isFinished ? 'finished' : currentPlayer}`}>
-        {statusMessage}
+        {absoluteStatus}
       </p>
     </section>
   );

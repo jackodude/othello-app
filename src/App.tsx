@@ -3,6 +3,13 @@ import type { FormEvent } from 'react';
 
 import { Board } from './components/Board';
 import { GameStatus } from './components/GameStatus';
+import {
+  DEFAULT_GAME_PREFERENCES,
+  loadGamePreferences,
+  saveGamePreferences,
+  shouldShowVisualLegalMoves,
+} from './hooks/gamePreferences';
+import { getRelativeStatusMessage } from './hooks/gamePresentation';
 import { shouldShowInvitationPanel, shouldShowLegalMoves } from './hooks/gameUiState';
 import { useGame } from './hooks/useGame';
 import './App.css';
@@ -32,9 +39,18 @@ function App() {
     errorMessage,
     errorKind,
     syncWarningMessage,
+    recentPositions,
   } = useGame();
   const [joinCodeInput, setJoinCodeInput] = useState(() => joinCode ?? '');
   const [invitationInput, setInvitationInput] = useState('');
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const [preferences, setPreferences] = useState(() => {
+    if (typeof window === 'undefined') {
+      return DEFAULT_GAME_PREFERENCES;
+    }
+
+    return loadGamePreferences(window.localStorage);
+  });
 
   function handleLoadSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -46,7 +62,6 @@ function App() {
     void claimWhiteFromInvitation(invitationInput);
   }
 
-  const isActiveGame = gameState.status !== 'finished';
   const showLegalMoves = shouldShowLegalMoves({
     isAuthenticated,
     opponentJoined,
@@ -56,16 +71,49 @@ function App() {
     isLoading,
   });
   const boardDisabled = !showLegalMoves;
+  const showVisualLegalMoves = shouldShowVisualLegalMoves(
+    showLegalMoves,
+    preferences,
+  );
+  const visibleRecentPositions = preferences.highlightLastMove
+    ? recentPositions
+    : [];
 
-  const turnMessage = !hasSelectedGame
-    ? null
-    : !isActiveGame
-      ? 'Game complete'
-      : !opponentJoined
-        ? 'Waiting for opponent to join'
-        : isYourTurn
-          ? 'Your turn'
-          : "Opponent's turn";
+  function updatePreference<Key extends keyof typeof preferences>(
+    key: Key,
+    value: (typeof preferences)[Key],
+  ) {
+    setPreferences((currentPreferences) => {
+      const nextPreferences = {
+        ...currentPreferences,
+        [key]: value,
+      };
+      saveGamePreferences(window.localStorage, nextPreferences);
+      return nextPreferences;
+    });
+  }
+
+  const statusMessage = getRelativeStatusMessage({
+    gameStatus: gameState.status,
+    result,
+    playerColor,
+    opponentJoined,
+    isYourTurn,
+  });
+
+  async function handleCopyInvitation() {
+    if (!invitation) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard?.writeText(invitation);
+      setCopyFeedback('Copied invitation');
+      window.setTimeout(() => setCopyFeedback(null), 1800);
+    } catch {
+      setCopyFeedback('Copy failed');
+    }
+  }
 
   return (
     <main className="app">
@@ -73,6 +121,43 @@ function App() {
         <h1>Othello</h1>
         <p className="subtitle">Classic Reversi, shared by join code</p>
       </header>
+
+      <details className="settings-panel">
+        <summary>Settings</summary>
+        <fieldset className="settings-panel__options">
+          <legend>Game preferences</legend>
+          <label className="settings-option">
+            <input
+              type="checkbox"
+              checked={preferences.highlightLastMove}
+              onChange={(event) =>
+                updatePreference('highlightLastMove', event.target.checked)
+              }
+            />
+            <span>Highlight last move</span>
+          </label>
+          <label className="settings-option">
+            <input
+              type="checkbox"
+              checked={preferences.animateDiscChanges}
+              onChange={(event) =>
+                updatePreference('animateDiscChanges', event.target.checked)
+              }
+            />
+            <span>Animate disc changes</span>
+          </label>
+          <label className="settings-option">
+            <input
+              type="checkbox"
+              checked={preferences.showLegalMoveIndicators}
+              onChange={(event) =>
+                updatePreference('showLegalMoveIndicators', event.target.checked)
+              }
+            />
+            <span>Show legal move indicators</span>
+          </label>
+        </fieldset>
+      </details>
 
       {showGameSelection && (
         <>
@@ -147,7 +232,7 @@ function App() {
             <strong>
               {playerColor ? `You are ${playerColor === 'black' ? 'Black' : 'White'}` : 'No player identity'}
             </strong>
-            {turnMessage && <span>{turnMessage}</span>}
+            <span>{statusMessage}</span>
           </div>
           <button type="button" className="load-game-button" onClick={switchGame}>
             Switch game
@@ -171,11 +256,17 @@ function App() {
             <button
               type="button"
               className="load-game-button"
-              onClick={() => invitation && void navigator.clipboard?.writeText(invitation)}
+              aria-label="Copy White invitation"
+              onClick={() => void handleCopyInvitation()}
             >
               Copy
             </button>
           </div>
+          {copyFeedback && (
+            <span className="copy-feedback" role="status">
+              {copyFeedback}
+            </span>
+          )}
         </section>
       )}
 
@@ -210,10 +301,12 @@ function App() {
         <>
           <GameStatus
             currentPlayer={gameState.currentPlayer}
+            playerColor={playerColor}
             scores={scores}
             isFinished={gameState.status === 'finished'}
             result={result}
             consecutivePasses={gameState.consecutivePasses}
+            statusMessage={statusMessage}
           />
 
           <Board
@@ -223,6 +316,9 @@ function App() {
             onCellClick={playMove}
             disabled={boardDisabled}
             showLegalMoves={showLegalMoves}
+            showLegalMoveIndicators={showVisualLegalMoves}
+            recentPositions={visibleRecentPositions}
+            animateChanges={preferences.animateDiscChanges}
           />
         </>
       ) : (

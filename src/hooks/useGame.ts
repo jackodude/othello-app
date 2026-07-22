@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createInitialGameState, getGameResult, getScores } from '../game';
 import type { GameState, Player, Position } from '../game';
 import { createGamePoller } from './gamePolling';
+import { getChangedPositions } from './gamePresentation';
 import { parseInvitation } from './invitation';
 
 interface GameRecord {
@@ -148,6 +149,7 @@ export function useGame() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [errorKind, setErrorKind] = useState<GameErrorKind | null>(null);
   const [syncWarningMessage, setSyncWarningMessage] = useState<string | null>(null);
+  const [recentPositions, setRecentPositions] = useState<readonly Position[]>([]);
   const [isSwitchingGame, setIsSwitchingGame] = useState(false);
   const initialJoinCodeRef = useRef(selectedJoinCode);
   const initialPlayerTokenRef = useRef(playerToken);
@@ -164,7 +166,12 @@ export function useGame() {
 
   const applyAuthenticatedGame = useCallback(
     (loadedGame: GameRecord, token: string) => {
-      setGame(loadedGame);
+      setGame((currentGame) => {
+        setRecentPositions(
+          getChangedPositions(currentGame?.state.board ?? null, loadedGame.state.board),
+        );
+        return loadedGame;
+      });
       setSelectedJoinCode(loadedGame.joinCode);
       setPlayerToken(token);
       setSyncWarningMessage(null);
@@ -298,7 +305,12 @@ export function useGame() {
       getCurrentVersion: () => currentVersionRef.current,
       getGameVersion: (polledGame) => polledGame.version,
       onNewerGame: (polledGame) => {
-        setGame(polledGame);
+        setGame((currentGame) => {
+          setRecentPositions(
+            getChangedPositions(currentGame?.state.board ?? null, polledGame.state.board),
+          );
+          return polledGame;
+        });
       },
       onRepeatedFailure: () => {
         setSyncWarningMessage('Sync is temporarily delayed.');
@@ -351,7 +363,12 @@ export function useGame() {
           move,
           game.version,
         );
-        setGame(updatedGame);
+        setGame((currentGame) => {
+          setRecentPositions(
+            getChangedPositions(currentGame?.state.board ?? null, updatedGame.state.board),
+          );
+          return updatedGame;
+        });
         setSyncWarningMessage(null);
       } catch (error) {
         const kind = getErrorKind(error);
@@ -491,5 +508,6 @@ export function useGame() {
     errorMessage,
     errorKind,
     syncWarningMessage,
+    recentPositions,
   };
 }
