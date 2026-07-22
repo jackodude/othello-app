@@ -6,6 +6,7 @@ interface BoardProps {
   currentPlayer: Player;
   onCellClick: (position: Position) => void;
   disabled: boolean;
+  showLegalMoves: boolean;
 }
 
 function isLegalMoveAt(
@@ -22,12 +23,13 @@ export function Board({
   currentPlayer,
   onCellClick,
   disabled,
+  showLegalMoves,
 }: BoardProps) {
   return (
     <div className="board" role="grid" aria-label="Othello board">
       {board.map((row, rowIndex) =>
         row.map((cell, colIndex) => {
-          const isLegal = isLegalMoveAt(legalMoves, rowIndex, colIndex);
+          const isLegal = showLegalMoves && isLegalMoveAt(legalMoves, rowIndex, colIndex);
           const cellLabel = cell
             ? `${cell} disc`
             : isLegal

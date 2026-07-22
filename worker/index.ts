@@ -13,12 +13,20 @@ interface GameRecord {
   readonly joinCode: string;
   readonly state: GameState;
   readonly version: number;
+  readonly playerColor?: Player;
+  readonly opponentJoined: boolean;
+  readonly playerToken?: string;
+  readonly invitation?: string;
 }
 
 interface MoveRequest {
   readonly row: number;
   readonly col: number;
   readonly expectedVersion: number;
+}
+
+interface JoinRequest {
+  readonly inviteToken: string;
 }
 
 interface GameRow {
@@ -34,6 +42,14 @@ interface GameRow {
   readonly version: number;
   readonly created_at: string;
   readonly updated_at: string;
+  readonly black_player_token_digest: string;
+  readonly white_player_token_digest: string | null;
+  readonly white_invite_token_digest: string;
+  readonly white_joined: number;
+  readonly black_player_created_at: string;
+  readonly white_invite_created_at: string;
+  readonly white_invite_claimed_at: string | null;
+  readonly white_player_created_at: string | null;
 }
 
 interface StoredGame {
@@ -46,6 +62,10 @@ interface StoredGame {
   readonly whiteScore: number;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly blackPlayerTokenDigest: string;
+  readonly whitePlayerTokenDigest: string | null;
+  readonly whiteInviteTokenDigest: string;
+  readonly whiteJoined: boolean;
 }
 
 interface WorkerEnv extends Env {
@@ -55,6 +75,7 @@ interface WorkerEnv extends Env {
 const JOIN_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const JOIN_CODE_LENGTH = 6;
 const MAX_JOIN_CODE_ATTEMPTS = 8;
+const TOKEN_BYTE_LENGTH = 32;
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return Response.json(body, init);
@@ -64,12 +85,19 @@ function errorResponse(status: number, message: string): Response {
   return jsonResponse({ error: message }, { status });
 }
 
-function toGameRecord(game: StoredGame): GameRecord {
+function toGameRecord(
+  game: StoredGame,
+  playerColor?: Player,
+  extras?: Pick<GameRecord, 'playerToken' | 'invitation'>,
+): GameRecord {
   return {
     id: game.id,
     joinCode: game.joinCode,
     state: game.state,
     version: game.version,
+    playerColor,
+    opponentJoined: playerColor === 'white' ? true : game.whiteJoined,
+    ...extras,
   };
 }
 
@@ -100,6 +128,31 @@ function isValidJoinCode(code: string): boolean {
   );
 }
 
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function generateToken(): string {
+  const bytes = new Uint8Array(TOKEN_BYTE_LENGTH);
+  crypto.getRandomValues(bytes);
+  return bytesToBase64Url(bytes);
+}
+
+async function digestToken(token: string): Promise<string> {
+  const data = new TextEncoder().encode(token);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return bytesToHex(new Uint8Array(digest));
+}
+
 function generateJoinCode(): string {
   const values = new Uint32Array(JOIN_CODE_LENGTH);
   crypto.getRandomValues(values);
@@ -107,6 +160,14 @@ function generateJoinCode(): string {
   return [...values]
     .map((value) => JOIN_CODE_ALPHABET[value % JOIN_CODE_ALPHABET.length])
     .join('');
+}
+
+function parseBearerToken(request: Request): string | null {
+  const header = request.headers.get('Authorization');
+  const match = header?.match(/^Bearer\s+(.+)$/i);
+  const token = match?.[1]?.trim();
+
+  return token || null;
 }
 
 function parseBoard(value: string): Board | null {
@@ -162,7 +223,13 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
     !Number.isInteger(row.black_score) ||
     !Number.isInteger(row.white_score) ||
     typeof row.created_at !== 'string' ||
-    typeof row.updated_at !== 'string'
+    typeof row.updated_at !== 'string' ||
+    typeof row.black_player_token_digest !== 'string' ||
+    (row.white_invite_token_digest !== null &&
+      typeof row.white_invite_token_digest !== 'string') ||
+    (row.white_player_token_digest !== null &&
+      typeof row.white_player_token_digest !== 'string') ||
+    row.white_joined !== 0 && row.white_joined !== 1
   ) {
     return null;
   }
@@ -203,6 +270,10 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
     whiteScore: scores.white,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    blackPlayerTokenDigest: row.black_player_token_digest,
+    whitePlayerTokenDigest: row.white_player_token_digest,
+    whiteInviteTokenDigest: row.white_invite_token_digest ?? '',
+    whiteJoined: row.white_joined === 1,
   };
 }
 
@@ -252,6 +323,22 @@ async function parseMoveRequest(request: Request): Promise<MoveRequest | null> {
   return { row, col, expectedVersion };
 }
 
+async function parseJoinRequest(request: Request): Promise<JoinRequest | null> {
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return null;
+  }
+
+  if (!isPlainObject(body) || typeof body.inviteToken !== 'string' || !body.inviteToken) {
+    return null;
+  }
+
+  return { inviteToken: body.inviteToken };
+}
+
 async function getGameByJoinCode(
   db: D1Database,
   joinCode: string,
@@ -266,7 +353,10 @@ async function getGameByJoinCode(
     .prepare(
       `SELECT id, join_code, board_json, current_player, status, winner,
               black_score, white_score, consecutive_passes, version,
-              created_at, updated_at
+              created_at, updated_at, black_player_token_digest,
+              white_player_token_digest, white_invite_token_digest,
+              white_joined, black_player_created_at, white_invite_created_at,
+              white_invite_claimed_at, white_player_created_at
        FROM games
        WHERE join_code = ?`,
     )
@@ -280,11 +370,39 @@ async function getGameByJoinCode(
   return rowToStoredGame(row);
 }
 
+async function authenticateGame(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<{ readonly game: StoredGame; readonly playerColor: Player } | Response> {
+  const game = await getGameByJoinCode(db, joinCode);
+  if (!game) {
+    return errorResponse(404, 'Game not found');
+  }
+
+  const token = parseBearerToken(request);
+  if (!token) {
+    return errorResponse(401, 'Missing player token');
+  }
+
+  const tokenDigest = await digestToken(token);
+  if (tokenDigest === game.blackPlayerTokenDigest) {
+    return { game, playerColor: 'black' };
+  }
+  if (game.whitePlayerTokenDigest && tokenDigest === game.whitePlayerTokenDigest) {
+    return { game, playerColor: 'white' };
+  }
+
+  return errorResponse(401, 'Invalid player token');
+}
+
 async function insertGame(
   db: D1Database,
   id: string,
   joinCode: string,
   state: GameState,
+  blackTokenDigest: string,
+  whiteInviteTokenDigest: string,
 ): Promise<boolean> {
   const fields = gameStateToStorageFields(state);
   const now = new Date().toISOString();
@@ -296,8 +414,11 @@ async function insertGame(
         `INSERT INTO games (
           id, join_code, board_json, current_player, status, winner,
           black_score, white_score, consecutive_passes, version,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          created_at, updated_at, black_player_token_digest,
+          white_player_token_digest, white_invite_token_digest, white_joined,
+          black_player_created_at, white_invite_created_at,
+          white_invite_claimed_at, white_player_created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         id,
@@ -312,6 +433,14 @@ async function insertGame(
         version,
         now,
         now,
+        blackTokenDigest,
+        null,
+        whiteInviteTokenDigest,
+        0,
+        now,
+        now,
+        null,
+        null,
       )
       .run();
   } catch {
@@ -321,20 +450,72 @@ async function insertGame(
   return true;
 }
 
-async function createGame(db: D1Database): Promise<StoredGame | null> {
+async function createGame(db: D1Database): Promise<GameRecord | null> {
   const state = createInitialGameState();
+  const blackToken = generateToken();
+  const whiteInviteToken = generateToken();
+  const blackTokenDigest = await digestToken(blackToken);
+  const whiteInviteTokenDigest = await digestToken(whiteInviteToken);
 
   for (let attempt = 0; attempt < MAX_JOIN_CODE_ATTEMPTS; attempt += 1) {
     const id = crypto.randomUUID();
     const joinCode = generateJoinCode();
-    const didInsert = await insertGame(db, id, joinCode, state);
+    const didInsert = await insertGame(
+      db,
+      id,
+      joinCode,
+      state,
+      blackTokenDigest,
+      whiteInviteTokenDigest,
+    );
 
     if (didInsert) {
-      return getGameByJoinCode(db, joinCode);
+      const game = await getGameByJoinCode(db, joinCode);
+      return game
+        ? toGameRecord(game, 'black', {
+            playerToken: blackToken,
+            invitation: `${joinCode}:${whiteInviteToken}`,
+          })
+        : null;
     }
   }
 
   return null;
+}
+
+async function claimWhite(
+  db: D1Database,
+  game: StoredGame,
+  inviteTokenDigest: string,
+  whiteTokenDigest: string,
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE games
+       SET white_player_token_digest = ?,
+           white_joined = 1,
+           white_invite_token_digest = NULL,
+           version = ?,
+           white_invite_claimed_at = ?,
+           white_player_created_at = ?,
+           updated_at = ?
+       WHERE id = ? AND join_code = ? AND white_joined = 0
+         AND white_invite_token_digest = ?`,
+    )
+    .bind(
+      whiteTokenDigest,
+      game.version + 1,
+      now,
+      now,
+      now,
+      game.id,
+      game.joinCode,
+      inviteTokenDigest,
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
 }
 
 async function persistMove(
@@ -379,6 +560,47 @@ async function persistMove(
   return (result.meta.changes ?? 0) > 0;
 }
 
+async function handleJoin(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<Response> {
+  const joinRequest = await parseJoinRequest(request);
+  if (!joinRequest) {
+    return errorResponse(400, 'Malformed join request');
+  }
+
+  const game = await getGameByJoinCode(db, joinCode);
+  if (!game) {
+    return errorResponse(404, 'Game not found');
+  }
+
+  if (game.whiteJoined) {
+    return errorResponse(409, 'White already joined');
+  }
+
+  const inviteDigest = await digestToken(joinRequest.inviteToken);
+  if (inviteDigest !== game.whiteInviteTokenDigest) {
+    return errorResponse(403, 'Invalid invitation token');
+  }
+
+  const whiteToken = generateToken();
+  const whiteTokenDigest = await digestToken(whiteToken);
+  const didClaim = await claimWhite(db, game, inviteDigest, whiteTokenDigest);
+  if (!didClaim) {
+    return errorResponse(409, 'White already joined');
+  }
+
+  const updatedGame = await getGameByJoinCode(db, game.joinCode);
+  if (!updatedGame) {
+    return errorResponse(404, 'Game not found');
+  }
+
+  return jsonResponse(
+    toGameRecord(updatedGame, 'white', { playerToken: whiteToken }),
+  );
+}
+
 async function handleMove(
   request: Request,
   db: D1Database,
@@ -389,11 +611,18 @@ async function handleMove(
     return errorResponse(400, 'Malformed move request');
   }
 
-  const game = await getGameByJoinCode(db, joinCode);
-  if (!game) {
-    return errorResponse(404, 'Game not found');
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
   }
 
+  const { game, playerColor } = authResult;
+  if (!game.whiteJoined) {
+    return errorResponse(403, 'Waiting for opponent to join');
+  }
+  if (playerColor !== game.state.currentPlayer) {
+    return errorResponse(403, 'Not your turn');
+  }
   if (moveRequest.expectedVersion !== game.version) {
     return errorResponse(409, 'Stale game version');
   }
@@ -415,20 +644,21 @@ async function handleMove(
     return errorResponse(404, 'Game not found');
   }
 
-  return jsonResponse(toGameRecord(persistedGame));
+  return jsonResponse(toGameRecord(persistedGame, playerColor));
 }
 
 function parseGamePath(pathname: string):
-  | { readonly code: string; readonly action: 'read' | 'move' }
+  | { readonly code: string; readonly action: 'read' | 'move' | 'join' }
   | null {
-  const match = /^\/api\/games\/([^/]+)(?:\/moves)?$/.exec(pathname);
+  const match = /^\/api\/games\/([^/]+)(?:\/(moves|join))?$/.exec(pathname);
   if (!match) {
     return null;
   }
 
+  const suffix = match[2];
   return {
     code: decodeURIComponent(match[1]),
-    action: pathname.endsWith('/moves') ? 'move' : 'read',
+    action: suffix === 'moves' ? 'move' : suffix === 'join' ? 'join' : 'read',
   };
 }
 
@@ -443,17 +673,21 @@ async function routeApiRequest(
       return errorResponse(500, 'Unable to create game');
     }
 
-    return jsonResponse(toGameRecord(game), { status: 201 });
+    return jsonResponse(game, { status: 201 });
   }
 
   const gamePath = parseGamePath(url.pathname);
+  if (gamePath?.action === 'join' && request.method === 'POST') {
+    return handleJoin(request, env.DB, gamePath.code);
+  }
+
   if (gamePath?.action === 'read' && request.method === 'GET') {
-    const game = await getGameByJoinCode(env.DB, gamePath.code);
-    if (!game) {
-      return errorResponse(404, 'Game not found');
+    const authResult = await authenticateGame(request, env.DB, gamePath.code);
+    if (authResult instanceof Response) {
+      return authResult;
     }
 
-    return jsonResponse(toGameRecord(game));
+    return jsonResponse(toGameRecord(authResult.game, authResult.playerColor));
   }
 
   if (gamePath?.action === 'move' && request.method === 'POST') {

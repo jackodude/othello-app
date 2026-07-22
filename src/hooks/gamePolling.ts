@@ -10,6 +10,7 @@ interface GamePollerOptions<TGame> {
   readonly onNewerGame: (game: TGame) => void;
   readonly onRepeatedFailure: () => void;
   readonly onSuccess: () => void;
+  readonly onError?: (error: unknown) => 'continue' | 'stop';
   readonly getGameVersion: (game: TGame) => number;
 }
 
@@ -32,6 +33,7 @@ export function createGamePoller<TGame>({
   onNewerGame,
   onRepeatedFailure,
   onSuccess,
+  onError,
   getGameVersion,
 }: GamePollerOptions<TGame>): GamePoller {
   let timerId: unknown = null;
@@ -78,7 +80,12 @@ export function createGamePoller<TGame>({
       if (currentVersion === null || getGameVersion(game) > currentVersion) {
         onNewerGame(game);
       }
-    } catch {
+    } catch (error) {
+      if (onError?.(error) === 'stop') {
+        isStopped = true;
+        clearTimer();
+        return;
+      }
       consecutiveFailures += 1;
       if (consecutiveFailures >= FAILURE_WARNING_THRESHOLD) {
         onRepeatedFailure();

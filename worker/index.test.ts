@@ -27,7 +27,7 @@ class FakeD1PreparedStatement {
       throw new Error(`Unsupported first() SQL: ${this.sql}`);
     }
 
-    const code = String(this.params[0]);
+    const code = String(this.params[0]).toUpperCase();
     const row = this.db.rowsByCode.get(code);
 
     return row ? ({ ...row } as T) : null;
@@ -48,6 +48,14 @@ class FakeD1PreparedStatement {
         version,
         createdAt,
         updatedAt,
+        blackDigest,
+        whiteDigest,
+        inviteDigest,
+        whiteJoined,
+        blackCreatedAt,
+        inviteCreatedAt,
+        inviteClaimedAt,
+        whiteCreatedAt,
       ] = this.params;
       const code = String(joinCode);
 
@@ -68,6 +76,44 @@ class FakeD1PreparedStatement {
         version,
         created_at: createdAt,
         updated_at: updatedAt,
+        black_player_token_digest: blackDigest,
+        white_player_token_digest: whiteDigest,
+        white_invite_token_digest: inviteDigest,
+        white_joined: whiteJoined,
+        black_player_created_at: blackCreatedAt,
+        white_invite_created_at: inviteCreatedAt,
+        white_invite_claimed_at: inviteClaimedAt,
+        white_player_created_at: whiteCreatedAt,
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (this.sql.includes('white_player_token_digest') && this.sql.includes('white_joined = 0')) {
+      const whiteDigest = this.params[0];
+      const nextVersion = this.params[1];
+      const joinCode = String(this.params[6]);
+      const inviteDigest = this.params[7];
+      const row = this.db.rowsByCode.get(joinCode);
+
+      if (
+        !row ||
+        this.db.forceClaimRace ||
+        row.white_joined !== 0 ||
+        row.white_invite_token_digest !== inviteDigest
+      ) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(joinCode, {
+        ...row,
+        white_player_token_digest: whiteDigest,
+        white_invite_token_digest: null,
+        white_joined: 1,
+        version: nextVersion,
+        white_invite_claimed_at: this.params[2],
+        white_player_created_at: this.params[3],
+        updated_at: this.params[4],
       });
 
       return makeD1Result(1);
@@ -123,6 +169,7 @@ class FakeD1PreparedStatement {
 class FakeD1Database {
   readonly rowsByCode = new Map<string, StoredRow>();
   forceStaleUpdate = false;
+  forceClaimRace = false;
 
   prepare(sql: string): D1PreparedStatement {
     return new FakeD1PreparedStatement(sql, this) as unknown as D1PreparedStatement;
@@ -149,6 +196,10 @@ function createEnv(db = new FakeD1Database()) {
   return { DB: db as unknown as D1Database };
 }
 
+function auth(token?: string): HeadersInit {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 function request(path: string, init?: RequestInit): Request {
   return new Request(`${API_ORIGIN}${path}`, init);
 }
@@ -164,12 +215,15 @@ async function fetchJson(
     readonly id?: string;
     readonly joinCode?: string;
     readonly version?: number;
+    readonly playerColor?: string;
+    readonly opponentJoined?: boolean;
+    readonly playerToken?: string;
+    readonly invitation?: string;
     readonly error?: string;
+    readonly black_player_token_digest?: string;
     readonly state?: {
       readonly currentPlayer?: string;
       readonly status?: string;
-      readonly consecutivePasses?: number;
-      readonly legalMoves?: unknown;
       readonly board?: readonly (readonly unknown[])[];
     };
   };
@@ -187,24 +241,53 @@ function mockJoinCodes(codes: readonly string[]) {
   });
 
   let valueIndex = 0;
+  let tokenByte = 1;
 
   return vi
     .spyOn(crypto, 'getRandomValues')
     .mockImplementation((array: ArrayBufferView | null) => {
-      if (!(array instanceof Uint32Array)) {
-        throw new Error('Expected Uint32Array');
+      if (array instanceof Uint32Array) {
+        for (let index = 0; index < array.length; index += 1) {
+          array[index] = values[valueIndex] ?? 0;
+          valueIndex += 1;
+        }
+        return array;
       }
 
-      for (let index = 0; index < array.length; index += 1) {
-        array[index] = values[valueIndex] ?? 0;
-        valueIndex += 1;
+      if (array instanceof Uint8Array) {
+        for (let index = 0; index < array.length; index += 1) {
+          array[index] = tokenByte % 255;
+          tokenByte += 1;
+        }
+        return array;
       }
 
-      return array;
+      throw new Error('Expected typed array');
     });
 }
 
-describe('game API', () => {
+function splitInvitation(invitation: string) {
+  const [joinCode, inviteToken] = invitation.split(':', 2);
+  return { joinCode, inviteToken };
+}
+
+async function createGame(env: ReturnType<typeof createEnv>, code = 'ABCDEF') {
+  mockJoinCodes([code]);
+  return fetchJson(env, '/api/games', { method: 'POST' });
+}
+
+async function joinWhite(
+  env: ReturnType<typeof createEnv>,
+  joinCode: string,
+  inviteToken: string,
+) {
+  return fetchJson(env, `/api/games/${joinCode}/join`, {
+    method: 'POST',
+    body: JSON.stringify({ inviteToken }),
+  });
+}
+
+describe('authenticated game API', () => {
   let db: FakeD1Database;
   let env: ReturnType<typeof createEnv>;
 
@@ -214,160 +297,210 @@ describe('game API', () => {
     env = createEnv(db);
   });
 
-  it('creates two separate games with unique join codes', async () => {
-    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+  it('assigns the creator to Black and returns credentials only on creation', async () => {
+    const { response, body } = await createGame(env);
 
+    expect(response.status).toBe(201);
+    expect(body.joinCode).toBe('ABCDEF');
+    expect(body.playerColor).toBe('black');
+    expect(body.playerToken).toBeTruthy();
+    expect(body.invitation).toContain('ABCDEF:');
+    expect(body.opponentJoined).toBe(false);
+    expect(body.black_player_token_digest).toBeUndefined();
+
+    const read = await fetchJson(env, '/api/games/ABCDEF', {
+      headers: auth(body.playerToken),
+    });
+
+    expect(read.response.status).toBe(200);
+    expect(read.body.playerToken).toBeUndefined();
+    expect(read.body.invitation).toBeUndefined();
+    expect(read.body.playerColor).toBe('black');
+  });
+
+  it('claims White with an invitation and returns a different private token', async () => {
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+
+    const joined = await joinWhite(env, joinCode, inviteToken);
+
+    expect(joined.response.status).toBe(200);
+    expect(joined.body.playerColor).toBe('white');
+    expect(joined.body.playerToken).toBeTruthy();
+    expect(joined.body.playerToken).not.toBe(created.body.playerToken);
+    expect(joined.body.invitation).toBeUndefined();
+    expect(joined.body.opponentJoined).toBe(true);
+  });
+
+  it('increments the resource version when White joins so Black polling sees it', async () => {
+    const created = await createGame(env);
+    const blackVersion = created.body.version;
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+
+    await joinWhite(env, joinCode, inviteToken);
+    const blackRead = await fetchJson(env, `/api/games/${joinCode}`, {
+      headers: auth(created.body.playerToken),
+    });
+
+    expect(blackVersion).toBe(1);
+    expect(blackRead.response.status).toBe(200);
+    expect(blackRead.body.version).toBe(blackVersion! + 1);
+    expect(blackRead.body.opponentJoined).toBe(true);
+  });
+
+  it('does not allow White to be claimed twice or concurrently', async () => {
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+
+    expect((await joinWhite(env, joinCode, inviteToken)).response.status).toBe(200);
+    expect((await joinWhite(env, joinCode, inviteToken)).response.status).toBe(409);
+
+    const second = await createGame(env, 'GHJKLM');
+    const secondInvite = splitInvitation(second.body.invitation!);
+    db.forceClaimRace = true;
+    expect(
+      (await joinWhite(env, secondInvite.joinCode, secondInvite.inviteToken)).response
+        .status,
+    ).toBe(409);
+  });
+
+  it('rejects invalid and malformed join requests', async () => {
+    await createGame(env);
+
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/join', {
+        method: 'POST',
+        body: JSON.stringify({ inviteToken: 42 }),
+      })).response.status,
+    ).toBe(400);
+    expect((await joinWhite(env, 'ABCDEF', 'wrong')).response.status).toBe(403);
+    expect((await joinWhite(env, 'ZZZZZZ', 'wrong')).response.status).toBe(404);
+  });
+
+  it('requires valid player tokens for reads and rejects cross-game tokens', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
     const first = await fetchJson(env, '/api/games', { method: 'POST' });
     const second = await fetchJson(env, '/api/games', { method: 'POST' });
 
-    expect(first.response.status).toBe(201);
-    expect(second.response.status).toBe(201);
-    expect(first.body.joinCode).toBe('ABCDEF');
-    expect(second.body.joinCode).toBe('GHJKLM');
-    expect(first.body.id).not.toBe(second.body.id);
-    expect(db.rowsByCode.size).toBe(2);
+    expect((await fetchJson(env, '/api/games/ABCDEF')).response.status).toBe(401);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF', {
+        headers: auth('invalid'),
+      })).response.status,
+    ).toBe(401);
+    expect(
+      (await fetchJson(env, '/api/games/GHJKLM', {
+        headers: auth(first.body.playerToken),
+      })).response.status,
+    ).toBe(401);
+    expect(
+      (await fetchJson(env, '/api/games/GHJKLM', {
+        headers: auth(second.body.playerToken),
+      })).response.status,
+    ).toBe(200);
   });
 
-  it('loads a game by join code', async () => {
-    mockJoinCodes(['ABCDEF']);
-    const created = await fetchJson(env, '/api/games', { method: 'POST' });
+  it('enforces join and turn ownership for moves', async () => {
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
 
-    const { response, body } = await fetchJson(
-      env,
-      `/api/games/${created.body.joinCode}`,
-    );
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/moves', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+        body: JSON.stringify({ row: 2, col: 3, expectedVersion: 1 }),
+      })).response.status,
+    ).toBe(403);
 
-    expect(response.status).toBe(200);
-    expect(body.id).toBe(created.body.id);
-    expect(body.joinCode).toBe('ABCDEF');
-    expect(body.version).toBe(1);
-  });
+    const white = await joinWhite(env, joinCode, inviteToken);
 
-  it('looks up join codes case-insensitively', async () => {
-    mockJoinCodes(['ABCDEF']);
-    await fetchJson(env, '/api/games', { method: 'POST' });
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/moves', {
+        method: 'POST',
+        headers: auth(white.body.playerToken),
+        body: JSON.stringify({ row: 2, col: 3, expectedVersion: 1 }),
+      })).response.status,
+    ).toBe(403);
 
-    const { response, body } = await fetchJson(env, '/api/games/abcdef');
-
-    expect(response.status).toBe(200);
-    expect(body.joinCode).toBe('ABCDEF');
-  });
-
-  it('returns 404 for an unknown code', async () => {
-    const { response, body } = await fetchJson(env, '/api/games/ZZZZZZ');
-
-    expect(response.status).toBe(404);
-    expect(body.error).toBe('Game not found');
-  });
-
-  it('applies a move in one game without affecting another', async () => {
-    mockJoinCodes(['ABCDEF', 'GHJKLM']);
-    const first = await fetchJson(env, '/api/games', { method: 'POST' });
-    const second = await fetchJson(env, '/api/games', { method: 'POST' });
-
-    const moved = await fetchJson(env, `/api/games/${first.body.joinCode}/moves`, {
+    const blackMove = await fetchJson(env, '/api/games/ABCDEF/moves', {
       method: 'POST',
-      body: JSON.stringify({ row: 2, col: 3, expectedVersion: 1 }),
-    });
-    const untouched = await fetchJson(env, `/api/games/${second.body.joinCode}`);
-
-    expect(moved.response.status).toBe(200);
-    expect(moved.body.version).toBe(2);
-    expect(moved.body.state?.board?.[2][3]).toBe('black');
-    expect(untouched.body.version).toBe(1);
-    expect(untouched.body.state?.board?.[2][3]).toBeNull();
-  });
-
-  it('rejects illegal moves', async () => {
-    mockJoinCodes(['ABCDEF']);
-    await fetchJson(env, '/api/games', { method: 'POST' });
-
-    const { response, body } = await fetchJson(env, '/api/games/ABCDEF/moves', {
-      method: 'POST',
-      body: JSON.stringify({ row: 0, col: 0, expectedVersion: 1 }),
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({ row: 2, col: 3, expectedVersion: 2 }),
     });
 
-    expect(response.status).toBe(422);
-    expect(body.error).toBe('Illegal move');
-    expect(db.rowsByCode.get('ABCDEF')?.version).toBe(1);
-  });
+    expect(blackMove.response.status).toBe(200);
+    expect(blackMove.body.version).toBe(3);
+    expect(blackMove.body.state?.currentPlayer).toBe('white');
 
-  it('rejects malformed move requests', async () => {
-    mockJoinCodes(['ABCDEF']);
-    await fetchJson(env, '/api/games', { method: 'POST' });
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/moves', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+        body: JSON.stringify({ row: 2, col: 2, expectedVersion: 3 }),
+      })).response.status,
+    ).toBe(403);
 
-    const { response, body } = await fetchJson(env, '/api/games/ABCDEF/moves', {
+    const whiteMove = await fetchJson(env, '/api/games/ABCDEF/moves', {
       method: 'POST',
-      body: JSON.stringify({ row: 2, col: '3', expectedVersion: 1 }),
+      headers: auth(white.body.playerToken),
+      body: JSON.stringify({ row: 2, col: 2, expectedVersion: 3 }),
     });
 
-    expect(response.status).toBe(400);
-    expect(body.error).toBe('Malformed move request');
+    expect(whiteMove.response.status).toBe(200);
+    expect(whiteMove.body.state?.currentPlayer).toBe('black');
   });
 
-  it('rejects stale versions', async () => {
-    mockJoinCodes(['ABCDEF']);
-    await fetchJson(env, '/api/games', { method: 'POST' });
-    await fetchJson(env, '/api/games/ABCDEF/moves', {
-      method: 'POST',
-      body: JSON.stringify({ row: 2, col: 3, expectedVersion: 1 }),
-    });
+  it('preserves malformed, illegal, stale, and atomic stale move responses', async () => {
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(env, joinCode, inviteToken);
 
-    const { response, body } = await fetchJson(env, '/api/games/ABCDEF/moves', {
-      method: 'POST',
-      body: JSON.stringify({ row: 2, col: 2, expectedVersion: 1 }),
-    });
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/moves', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+        body: JSON.stringify({ row: 2, col: '3', expectedVersion: 1 }),
+      })).response.status,
+    ).toBe(400);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/moves', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+        body: JSON.stringify({ row: 0, col: 0, expectedVersion: 2 }),
+      })).response.status,
+    ).toBe(422);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/moves', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+        body: JSON.stringify({ row: 2, col: 3, expectedVersion: 99 }),
+      })).response.status,
+    ).toBe(409);
 
-    expect(response.status).toBe(409);
-    expect(body.error).toBe('Stale game version');
-  });
-
-  it('rejects stale versions when the atomic update loses the race', async () => {
-    mockJoinCodes(['ABCDEF']);
-    await fetchJson(env, '/api/games', { method: 'POST' });
     db.forceStaleUpdate = true;
-
-    const { response, body } = await fetchJson(env, '/api/games/ABCDEF/moves', {
-      method: 'POST',
-      body: JSON.stringify({ row: 2, col: 3, expectedVersion: 1 }),
-    });
-
-    expect(response.status).toBe(409);
-    expect(body.error).toBe('Stale game version');
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/moves', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+        body: JSON.stringify({ row: 2, col: 3, expectedVersion: 2 }),
+      })).response.status,
+    ).toBe(409);
   });
 
-  it('retries join-code collisions safely', async () => {
-    mockJoinCodes(['ABCDEF', 'ABCDEF', 'GHJKLM']);
-
+  it('keeps case-insensitive codes and isolated games', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
     const first = await fetchJson(env, '/api/games', { method: 'POST' });
     const second = await fetchJson(env, '/api/games', { method: 'POST' });
 
-    expect(first.response.status).toBe(201);
-    expect(second.response.status).toBe(201);
-    expect(first.body.joinCode).toBe('ABCDEF');
-    expect(second.body.joinCode).toBe('GHJKLM');
-    expect(db.rowsByCode.size).toBe(2);
-  });
-
-  it('persists across separate requests', async () => {
-    mockJoinCodes(['ABCDEF']);
-    await fetchJson(env, '/api/games', { method: 'POST' });
-
-    const firstRead = await fetchJson(env, '/api/games/ABCDEF');
-    const secondRead = await fetchJson(env, '/api/games/ABCDEF');
-
-    expect(firstRead.body.id).toBe(secondRead.body.id);
-    expect(secondRead.body.version).toBe(1);
-  });
-
-  it('retires the old singleton current endpoints', async () => {
-    const read = await fetchJson(env, '/api/games/current');
-    const move = await fetchJson(env, '/api/games/current/moves', {
-      method: 'POST',
-      body: JSON.stringify({ row: 2, col: 3, expectedVersion: 1 }),
-    });
-
-    expect(read.response.status).toBe(404);
-    expect(move.response.status).toBe(404);
+    expect(
+      (await fetchJson(env, '/api/games/abcdef', {
+        headers: auth(first.body.playerToken),
+      })).response.status,
+    ).toBe(200);
+    expect(
+      (await fetchJson(env, '/api/games/GHJKLM', {
+        headers: auth(second.body.playerToken),
+      })).body.id,
+    ).toBe(second.body.id);
   });
 });

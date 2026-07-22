@@ -25,6 +25,7 @@ describe('createGamePoller', () => {
   let onNewerGame: ReturnType<typeof vi.fn<(game: PollGame) => void>>;
   let onRepeatedFailure: ReturnType<typeof vi.fn<() => void>>;
   let onSuccess: ReturnType<typeof vi.fn<() => void>>;
+  let onError: ReturnType<typeof vi.fn<(error: unknown) => 'continue' | 'stop'>>;
   let scheduledListener: (() => void) | null;
 
   beforeEach(() => {
@@ -36,6 +37,7 @@ describe('createGamePoller', () => {
     onNewerGame = vi.fn<(game: PollGame) => void>();
     onRepeatedFailure = vi.fn<() => void>();
     onSuccess = vi.fn<() => void>();
+    onError = vi.fn<(error: unknown) => 'continue' | 'stop'>(() => 'continue');
   });
 
   function createPoller() {
@@ -65,6 +67,7 @@ describe('createGamePoller', () => {
       onNewerGame,
       onRepeatedFailure,
       onSuccess,
+      onError,
     });
   }
 
@@ -84,6 +87,17 @@ describe('createGamePoller', () => {
 
     expect(onNewerGame).toHaveBeenCalledWith({ version: 2 });
     expect(onSuccess).toHaveBeenCalledOnce();
+  });
+
+  it('recognises newer metadata-only state by version', async () => {
+    const metadataUpdate = { version: 2 };
+    fetchGame.mockResolvedValueOnce(metadataUpdate);
+    const poller = createPoller();
+
+    poller.start();
+    await runScheduledPoll();
+
+    expect(onNewerGame).toHaveBeenCalledWith(metadataUpdate);
   });
 
   it('does not replace state when the version is unchanged', async () => {
@@ -183,5 +197,20 @@ describe('createGamePoller', () => {
 
     expect(fetchGame).not.toHaveBeenCalled();
     expect(visibilityListener).toBeNull();
+  });
+
+  it('can stop polling after an unrecoverable polling error', async () => {
+    const invalidCredential = new Error('invalid');
+    fetchGame.mockRejectedValueOnce(invalidCredential).mockResolvedValue({ version: 2 });
+    onError.mockReturnValueOnce('stop');
+    const poller = createPoller();
+
+    poller.start();
+    await runScheduledPoll();
+    await runScheduledPoll();
+
+    expect(onError).toHaveBeenCalledWith(invalidCredential);
+    expect(fetchGame).toHaveBeenCalledOnce();
+    expect(onRepeatedFailure).not.toHaveBeenCalled();
   });
 });
