@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 
 import { Board } from './components/Board';
@@ -9,10 +9,21 @@ import {
   saveGamePreferences,
   shouldShowVisualLegalMoves,
 } from './hooks/gamePreferences';
+import {
+  isInstallDismissed,
+  isIosLike,
+  isStandaloneDisplay,
+  recordInstallDismissal,
+  shouldShowIosInstallGuidance,
+} from './hooks/installPrompt';
 import { getRelativeStatusMessage } from './hooks/gamePresentation';
 import { shouldShowInvitationPanel, shouldShowLegalMoves } from './hooks/gameUiState';
 import { useGame } from './hooks/useGame';
 import './App.css';
+
+interface BeforeInstallPromptEvent extends Event {
+  readonly prompt: () => Promise<void>;
+}
 
 function App() {
   const {
@@ -44,6 +55,22 @@ function App() {
   const [joinCodeInput, setJoinCodeInput] = useState(() => joinCode ?? '');
   const [invitationInput, setInvitationInput] = useState('');
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const [installPrompt, setInstallPrompt] =
+    useState<BeforeInstallPromptEvent | null>(null);
+  const [isInstallHelpDismissed, setIsInstallHelpDismissed] = useState(() => {
+    if (typeof window === 'undefined') {
+      return true;
+    }
+
+    return isInstallDismissed(window.localStorage, Date.now());
+  });
+  const [isOnline, setIsOnline] = useState(() => {
+    if (typeof navigator === 'undefined') {
+      return true;
+    }
+
+    return navigator.onLine;
+  });
   const [preferences, setPreferences] = useState(() => {
     if (typeof window === 'undefined') {
       return DEFAULT_GAME_PREFERENCES;
@@ -51,6 +78,34 @@ function App() {
 
     return loadGamePreferences(window.localStorage);
   });
+
+  useEffect(() => {
+    function handleBeforeInstallPrompt(event: Event) {
+      event.preventDefault();
+      if (!isInstallDismissed(window.localStorage, Date.now())) {
+        setInstallPrompt(event as BeforeInstallPromptEvent);
+        setIsInstallHelpDismissed(false);
+      }
+    }
+
+    function handleOnline() {
+      setIsOnline(true);
+    }
+
+    function handleOffline() {
+      setIsOnline(false);
+    }
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   function handleLoadSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -115,6 +170,34 @@ function App() {
     }
   }
 
+  async function handleInstallClick() {
+    if (!installPrompt) {
+      return;
+    }
+
+    await installPrompt.prompt();
+    setInstallPrompt(null);
+  }
+
+  function dismissInstallHelp() {
+    recordInstallDismissal(window.localStorage, Date.now());
+    setInstallPrompt(null);
+    setIsInstallHelpDismissed(true);
+  }
+
+  const canUseNativeInstallPrompt = Boolean(installPrompt);
+  const isStandalone = typeof window !== 'undefined'
+    ? isStandaloneDisplay(navigator, window.matchMedia('(display-mode: standalone)'))
+    : false;
+  const showIosGuidance = typeof navigator !== 'undefined'
+    ? shouldShowIosInstallGuidance({
+        canUseNativePrompt: canUseNativeInstallPrompt,
+        dismissed: isInstallHelpDismissed,
+        isIos: isIosLike(navigator),
+        isStandalone,
+      })
+    : false;
+
   return (
     <main className="app">
       <header className="header">
@@ -158,6 +241,39 @@ function App() {
           </label>
         </fieldset>
       </details>
+
+      {(canUseNativeInstallPrompt || showIosGuidance) && (
+        <section className="install-panel" aria-label="Install Othello">
+          <div>
+            <strong>Install Othello</strong>
+            <p>
+              {canUseNativeInstallPrompt
+                ? 'Add this game to your device for quicker access.'
+                : 'On iPhone or iPad, use Share, then Add to Home Screen.'}
+            </p>
+          </div>
+          <div className="install-panel__actions">
+            {canUseNativeInstallPrompt && (
+              <button
+                type="button"
+                className="load-game-button"
+                onClick={() => void handleInstallClick()}
+              >
+                Install
+              </button>
+            )}
+            <button type="button" className="load-game-button" onClick={dismissInstallHelp}>
+              Not now
+            </button>
+          </div>
+        </section>
+      )}
+
+      {!isOnline && (
+        <div className="offline-warning" role="status">
+          App shell is available offline. Live games need an internet connection.
+        </div>
+      )}
 
       {showGameSelection && (
         <>

@@ -78,6 +78,31 @@
   height: 1rem;
 }
 
+.install-panel {
+  width: min(100%, 26rem);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  background: var(--surface);
+}
+
+.install-panel p {
+  margin: 0.2rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.install-panel__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
 .status__headline {
   display: grid;
   gap: 0.25rem;
@@ -234,6 +259,18 @@
   border-radius: 0.5rem;
   color: #854d0e;
   background: #fef9c3;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.offline-warning {
+  width: min(100%, 26rem);
+  margin: 0;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid #f97316;
+  border-radius: 0.5rem;
+  color: #9a3412;
+  background: #ffedd5;
   font-size: 0.85rem;
   text-align: center;
 }
@@ -504,10 +541,15 @@
 @media (max-width: 420px) {
   .game-controls,
   .identity-panel,
+  .install-panel,
   .join-form__row,
   .invitation-box,
   .settings-panel__options {
     grid-template-columns: 1fr;
+  }
+
+  .install-panel__actions {
+    justify-content: stretch;
   }
 
   .load-game-button,
