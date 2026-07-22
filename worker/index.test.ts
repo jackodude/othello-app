@@ -221,6 +221,10 @@ class FakeD1PreparedStatement {
         blackInviteDigest,
         blackInviteCreatedAt,
         blackInviteClaimedAt,
+        lastMoveVersion,
+        lastMovePlayer,
+        lastMovePlacedIndex,
+        lastMoveFlippedIndicesJson,
       ] = this.params;
       const code = String(joinCode);
 
@@ -254,6 +258,10 @@ class FakeD1PreparedStatement {
         black_invite_token_digest: blackInviteDigest,
         black_invite_created_at: blackInviteCreatedAt,
         black_invite_claimed_at: blackInviteClaimedAt,
+        last_move_version: lastMoveVersion,
+        last_move_player: lastMovePlayer,
+        last_move_placed_index: lastMovePlacedIndex,
+        last_move_flipped_indices_json: lastMoveFlippedIndicesJson,
       });
 
       return makeD1Result(1);
@@ -319,9 +327,9 @@ class FakeD1PreparedStatement {
     }
 
     if (this.sql.includes('UPDATE games')) {
-      const id = this.params[9];
-      const joinCode = String(this.params[10]);
-      const expectedVersion = this.params[11];
+      const id = this.params[13];
+      const joinCode = String(this.params[14]);
+      const expectedVersion = this.params[15];
       const currentRow = this.db.rowsByCode.get(joinCode);
 
       if (
@@ -342,6 +350,10 @@ class FakeD1PreparedStatement {
         whiteScore,
         consecutivePasses,
         version,
+        lastMoveVersion,
+        lastMovePlayer,
+        lastMovePlacedIndex,
+        lastMoveFlippedIndicesJson,
         updatedAt,
       ] = this.params;
 
@@ -355,6 +367,10 @@ class FakeD1PreparedStatement {
         white_score: whiteScore,
         consecutive_passes: consecutivePasses,
         version,
+        last_move_version: lastMoveVersion,
+        last_move_player: lastMovePlayer,
+        last_move_placed_index: lastMovePlacedIndex,
+        last_move_flipped_indices_json: lastMoveFlippedIndicesJson,
         updated_at: updatedAt,
       });
 
@@ -437,6 +453,12 @@ async function fetchJson(
     readonly opponentJoined?: boolean;
     readonly playerToken?: string;
     readonly invitation?: string;
+    readonly lastMove?: {
+      readonly version?: number;
+      readonly player?: string;
+      readonly placedIndex?: number;
+      readonly flippedIndices?: readonly number[];
+    } | null;
     readonly error?: string;
     readonly black_player_token_digest?: string;
     readonly state?: {
@@ -702,6 +724,17 @@ describe('authenticated game API', () => {
     expect(blackMove.response.status).toBe(200);
     expect(blackMove.body.version).toBe(3);
     expect(blackMove.body.state?.currentPlayer).toBe('white');
+    expect(blackMove.body.lastMove).toEqual({
+      version: 3,
+      player: 'black',
+      placedIndex: 19,
+      flippedIndices: [27],
+    });
+
+    const persistedRead = await fetchJson(env, '/api/games/ABCDEF', {
+      headers: auth(created.body.playerToken),
+    });
+    expect(persistedRead.body.lastMove).toEqual(blackMove.body.lastMove);
 
     expect(
       (await fetchJson(env, '/api/games/ABCDEF/moves', {
@@ -719,31 +752,39 @@ describe('authenticated game API', () => {
 
     expect(whiteMove.response.status).toBe(200);
     expect(whiteMove.body.state?.currentPlayer).toBe('black');
+    expect(whiteMove.body.lastMove?.player).toBe('white');
+    expect(whiteMove.body.lastMove?.version).toBe(4);
   });
 
   it('preserves malformed, illegal, stale, and atomic stale move responses', async () => {
     const created = await createGame(env);
     const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
-    await joinWhite(env, joinCode, inviteToken);
+    const white = await joinWhite(env, joinCode, inviteToken);
+    const validMove = await fetchJson(env, '/api/games/ABCDEF/moves', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({ row: 2, col: 3, expectedVersion: 2 }),
+    });
+    const previousLastMove = validMove.body.lastMove;
 
     expect(
       (await fetchJson(env, '/api/games/ABCDEF/moves', {
         method: 'POST',
         headers: auth(created.body.playerToken),
-        body: JSON.stringify({ row: 2, col: '3', expectedVersion: 1 }),
+        body: JSON.stringify({ row: 2, col: '3', expectedVersion: 3 }),
       })).response.status,
     ).toBe(400);
     expect(
       (await fetchJson(env, '/api/games/ABCDEF/moves', {
         method: 'POST',
-        headers: auth(created.body.playerToken),
-        body: JSON.stringify({ row: 0, col: 0, expectedVersion: 2 }),
+        headers: auth(white.body.playerToken),
+        body: JSON.stringify({ row: 0, col: 0, expectedVersion: 3 }),
       })).response.status,
     ).toBe(422);
     expect(
       (await fetchJson(env, '/api/games/ABCDEF/moves', {
         method: 'POST',
-        headers: auth(created.body.playerToken),
+        headers: auth(white.body.playerToken),
         body: JSON.stringify({ row: 2, col: 3, expectedVersion: 99 }),
       })).response.status,
     ).toBe(409);
@@ -752,10 +793,15 @@ describe('authenticated game API', () => {
     expect(
       (await fetchJson(env, '/api/games/ABCDEF/moves', {
         method: 'POST',
-        headers: auth(created.body.playerToken),
-        body: JSON.stringify({ row: 2, col: 3, expectedVersion: 2 }),
+        headers: auth(white.body.playerToken),
+        body: JSON.stringify({ row: 2, col: 2, expectedVersion: 3 }),
       })).response.status,
     ).toBe(409);
+
+    const read = await fetchJson(env, '/api/games/ABCDEF', {
+      headers: auth(created.body.playerToken),
+    });
+    expect(read.body.lastMove).toEqual(previousLastMove);
   });
 
   it('keeps case-insensitive codes and isolated games', async () => {
@@ -817,6 +863,7 @@ describe('authenticated game API', () => {
     expect(rematch.body.playerToken).toBeTruthy();
     expect(rematch.body.invitation).toContain('GHJKLM:');
     expect(rematch.body.state?.status).toBe('playing');
+    expect(rematch.body.lastMove).toBeNull();
     expect(db.rowsByCode.get(joinCode)).toEqual(original);
     expect(db.rowsByCode.get('GHJKLM')?.rematch_of_game_id).toBe(created.body.id);
   });
@@ -839,6 +886,7 @@ describe('authenticated game API', () => {
     expect(rematch.body.playerColor).toBe('white');
     expect(rematch.body.opponentJoined).toBe(false);
     expect(rematch.body.invitation).toContain('GHJKLM:');
+    expect(rematch.body.lastMove).toBeNull();
     expect(db.rowsByCode.get(joinCode)).toEqual(original);
     expect(db.rowsByCode.get('GHJKLM')?.rematch_of_game_id).toBe(created.body.id);
     expect(db.rowsByCode.get('GHJKLM')?.black_joined).toBe(0);
@@ -949,6 +997,7 @@ describe('authenticated game API', () => {
       rematchOfGameId: null,
       blackJoined: true,
       blackInviteTokenDigest: '',
+      lastMove: null,
     };
     const updatedGame = { ...previousGame, version: 2, whiteJoined: true };
 
@@ -986,6 +1035,7 @@ describe('authenticated game API', () => {
       rematchOfGameId: null,
       blackJoined: true,
       blackInviteTokenDigest: '',
+      lastMove: null,
     };
     db.pushSubscriptions.push({
       id: 'sub-1',
@@ -1033,6 +1083,7 @@ describe('authenticated game API', () => {
       rematchOfGameId: null,
       blackJoined: true,
       blackInviteTokenDigest: '',
+      lastMove: null,
     };
     db.pushNotificationEvents.push({
       id: 'event-1',

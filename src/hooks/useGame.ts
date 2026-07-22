@@ -3,7 +3,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createInitialGameState, getGameResult, getScores } from '../game';
 import type { GameState, Player, Position } from '../game';
 import { createGamePoller } from './gamePolling';
-import { getChangedPositions } from './gamePresentation';
+import {
+  getLastMovePositions,
+  readLastPresentedMoveVersion,
+  reconstructBoardBeforeLastMove,
+  shouldAnimateLastMove,
+  writeLastPresentedMoveVersion,
+  type LastMove,
+} from './gamePresentation';
 import { parseInvitation } from './invitation';
 
 interface GameRecord {
@@ -11,6 +18,7 @@ interface GameRecord {
   readonly joinCode: string;
   readonly state: GameState;
   readonly version: number;
+  readonly lastMove: LastMove | null;
   readonly playerColor?: Player;
   readonly opponentJoined: boolean;
   readonly playerToken?: string;
@@ -22,6 +30,12 @@ type GameErrorKind = 'not-found' | 'unauthorized' | 'api';
 const SELECTED_JOIN_CODE_KEY = 'othello.selectedJoinCode';
 const PLAYER_TOKEN_PREFIX = 'othello.playerToken.';
 const POLL_INTERVAL_MS = 2000;
+const PLACEMENT_MS = 140;
+const MOVE_ANIMATION_MS = 620;
+
+interface UseGameOptions {
+  readonly animateMoves: boolean;
+}
 
 function normalizeJoinCode(code: string): string {
   return code.trim().toUpperCase();
@@ -151,8 +165,9 @@ function getErrorKind(error: unknown): GameErrorKind {
     : 'api';
 }
 
-export function useGame() {
+export function useGame({ animateMoves }: UseGameOptions = { animateMoves: true }) {
   const [game, setGame] = useState<GameRecord | null>(null);
+  const [displayedGame, setDisplayedGame] = useState<GameRecord | null>(null);
   const [selectedJoinCode, setSelectedJoinCode] = useState<string | null>(
     readStoredJoinCode,
   );
@@ -167,12 +182,14 @@ export function useGame() {
   const [errorKind, setErrorKind] = useState<GameErrorKind | null>(null);
   const [syncWarningMessage, setSyncWarningMessage] = useState<string | null>(null);
   const [recentPositions, setRecentPositions] = useState<readonly Position[]>([]);
+  const [animationPhase, setAnimationPhase] = useState<'idle' | 'placing' | 'flipping'>('idle');
   const [isSwitchingGame, setIsSwitchingGame] = useState(false);
   const initialJoinCodeRef = useRef(selectedJoinCode);
   const initialPlayerTokenRef = useRef(playerToken);
   const currentVersionRef = useRef<number | null>(null);
+  const animationTimersRef = useRef<readonly number[]>([]);
 
-  const gameState = game?.state ?? createInitialGameState();
+  const gameState = displayedGame?.state ?? game?.state ?? createInitialGameState();
   const scores = getScores(gameState.board);
   const result =
     gameState.status === 'finished' ? getGameResult(scores) : null;
@@ -181,14 +198,103 @@ export function useGame() {
     currentVersionRef.current = game?.version ?? null;
   }, [game?.version]);
 
+  const clearAnimationTimers = useCallback(() => {
+    for (const timerId of animationTimersRef.current) {
+      window.clearTimeout(timerId);
+    }
+    animationTimersRef.current = [];
+  }, []);
+
+  const markMovePresented = useCallback((loadedGame: GameRecord) => {
+    if (loadedGame.lastMove && typeof window !== 'undefined') {
+      writeLastPresentedMoveVersion(
+        window.localStorage,
+        loadedGame.joinCode,
+        loadedGame.lastMove.version,
+      );
+    }
+  }, []);
+
+  const presentGame = useCallback(
+    (loadedGame: GameRecord) => {
+      clearAnimationTimers();
+      setGame(loadedGame);
+      setRecentPositions(getLastMovePositions(loadedGame.lastMove));
+
+      const lastPresentedVersion =
+        typeof window === 'undefined'
+          ? null
+          : readLastPresentedMoveVersion(window.localStorage, loadedGame.joinCode);
+      const shouldAnimate =
+        animateMoves &&
+        shouldAnimateLastMove({
+          joinCode: loadedGame.joinCode,
+          lastMove: loadedGame.lastMove,
+          currentVersion: loadedGame.version,
+          lastPresentedVersion,
+        });
+      const previousBoard = shouldAnimate
+        ? reconstructBoardBeforeLastMove(loadedGame.state.board, loadedGame.lastMove)
+        : null;
+
+      if (!shouldAnimate || !previousBoard) {
+        setDisplayedGame(loadedGame);
+        setAnimationPhase('idle');
+        markMovePresented(loadedGame);
+        return;
+      }
+
+      const preMoveGame: GameRecord = {
+        ...loadedGame,
+        state: {
+          ...loadedGame.state,
+          board: previousBoard,
+        },
+      };
+
+      setDisplayedGame(preMoveGame);
+      setAnimationPhase('placing');
+
+      const placementTimer = window.setTimeout(() => {
+        setDisplayedGame(loadedGame);
+        setAnimationPhase('flipping');
+      }, PLACEMENT_MS);
+      const completionTimer = window.setTimeout(() => {
+        setDisplayedGame(loadedGame);
+        setAnimationPhase('idle');
+        markMovePresented(loadedGame);
+      }, MOVE_ANIMATION_MS);
+      animationTimersRef.current = [placementTimer, completionTimer];
+    },
+    [animateMoves, clearAnimationTimers, markMovePresented],
+  );
+
+  useEffect(() => {
+    return () => {
+      clearAnimationTimers();
+    };
+  }, [clearAnimationTimers]);
+
+  useEffect(() => {
+    if (animateMoves || animationPhase === 'idle' || !game) {
+      return;
+    }
+
+    const timerId = window.setTimeout(() => {
+      clearAnimationTimers();
+      setDisplayedGame(game);
+      setAnimationPhase('idle');
+      markMovePresented(game);
+    }, 0);
+
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [animateMoves, animationPhase, clearAnimationTimers, game, markMovePresented]);
+
   const applyAuthenticatedGame = useCallback(
     (loadedGame: GameRecord, token: string) => {
-      setGame((currentGame) => {
-        setRecentPositions(
-          getChangedPositions(currentGame?.state.board ?? null, loadedGame.state.board),
-        );
-        return loadedGame;
-      });
+      presentGame(loadedGame);
       setSelectedJoinCode(loadedGame.joinCode);
       setPlayerToken(token);
       setSyncWarningMessage(null);
@@ -196,7 +302,7 @@ export function useGame() {
       storeJoinCode(loadedGame.joinCode);
       storePlayerToken(loadedGame.joinCode, token);
     },
-    [],
+    [presentGame],
   );
 
   const loadGame = useCallback(
@@ -204,6 +310,7 @@ export function useGame() {
       const normalizedCode = normalizeJoinCode(joinCode);
       if (!normalizedCode) {
         setGame(null);
+        setDisplayedGame(null);
         setSelectedJoinCode(null);
         setPlayerToken(null);
         setErrorMessage('Enter a join code.');
@@ -214,6 +321,7 @@ export function useGame() {
       const storedToken = readStoredPlayerToken(normalizedCode);
       if (!storedToken) {
         setGame(null);
+        setDisplayedGame(null);
         setSelectedJoinCode(normalizedCode);
         setPlayerToken(null);
         setErrorMessage('No saved player credential for that game.');
@@ -230,6 +338,7 @@ export function useGame() {
       } catch (error) {
         const kind = getErrorKind(error);
         setGame(null);
+        setDisplayedGame(null);
         setSelectedJoinCode(normalizedCode);
         setPlayerToken(kind === 'unauthorized' ? null : storedToken);
         setErrorKind(kind);
@@ -276,6 +385,7 @@ export function useGame() {
         if (isActive) {
           const kind = getErrorKind(error);
           setGame(null);
+          setDisplayedGame(null);
           setPlayerToken(kind === 'unauthorized' ? null : initialPlayerToken);
           setErrorKind(kind);
           setErrorMessage(
@@ -322,18 +432,13 @@ export function useGame() {
       getCurrentVersion: () => currentVersionRef.current,
       getGameVersion: (polledGame) => polledGame.version,
       onNewerGame: (polledGame) => {
-        setGame((currentGame) => {
-          setRecentPositions(
-            getChangedPositions(currentGame?.state.board ?? null, polledGame.state.board),
-          );
-          return polledGame;
-        });
+        presentGame(polledGame);
       },
       onRepeatedFailure: () => {
         setSyncWarningMessage('Sync is temporarily delayed.');
       },
       onSuccess: () => {
-      setSyncWarningMessage(null);
+        setSyncWarningMessage(null);
       },
       onError: (error) => {
         if (getErrorKind(error) !== 'unauthorized') {
@@ -353,7 +458,7 @@ export function useGame() {
     return () => {
       poller.stop();
     };
-  }, [game?.joinCode, playerToken]);
+  }, [game?.joinCode, playerToken, presentGame]);
 
   const playMove = useCallback(
     async (move: Position) => {
@@ -380,12 +485,7 @@ export function useGame() {
           move,
           game.version,
         );
-        setGame((currentGame) => {
-          setRecentPositions(
-            getChangedPositions(currentGame?.state.board ?? null, updatedGame.state.board),
-          );
-          return updatedGame;
-        });
+        presentGame(updatedGame);
         setSyncWarningMessage(null);
       } catch (error) {
         const kind = getErrorKind(error);
@@ -399,16 +499,17 @@ export function useGame() {
           setPlayerToken(null);
         } else {
           try {
-            setGame(await getGame(selectedJoinCode, playerToken));
+            presentGame(await getGame(selectedJoinCode, playerToken));
           } catch {
             setGame(null);
+            setDisplayedGame(null);
           }
         }
       } finally {
         setIsSubmittingMove(false);
       }
     },
-    [game, isSubmittingMove, playerToken, selectedJoinCode],
+    [game, isSubmittingMove, playerToken, presentGame, selectedJoinCode],
   );
 
   const startNewGame = useCallback(async () => {
@@ -515,6 +616,7 @@ export function useGame() {
     }
     setPlayerToken(null);
     setGame(null);
+    setDisplayedGame(null);
     setErrorMessage('Saved player credential removed.');
     setErrorKind('unauthorized');
   }, [selectedJoinCode]);
@@ -522,6 +624,7 @@ export function useGame() {
   const switchGame = useCallback(() => {
     setIsSwitchingGame(true);
     setGame(null);
+    setDisplayedGame(null);
     setPlayerToken(null);
     setErrorMessage(null);
     setErrorKind(null);
@@ -560,5 +663,8 @@ export function useGame() {
     errorKind,
     syncWarningMessage,
     recentPositions,
+    animationPhase,
+    lastMove: game?.lastMove ?? null,
+    isAnimatingMove: animationPhase !== 'idle',
   };
 }

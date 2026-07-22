@@ -440,6 +440,7 @@
   position: absolute;
   inset: 8%;
   border-radius: 50%;
+  transform-style: preserve-3d;
 }
 
 .disc--animated {
@@ -448,6 +449,51 @@
 
 .disc--recent.disc--animated {
   animation: disc-place 180ms ease-out, disc-highlight 650ms ease-out;
+}
+
+.disc--placing {
+  animation: disc-place 150ms ease-out, disc-highlight 520ms ease-out;
+}
+
+.disc--flipping {
+  background: transparent;
+  box-shadow: none;
+  animation: disc-flip 340ms ease-in-out;
+}
+
+.disc--flipping::before,
+.disc--flipping::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  backface-visibility: hidden;
+}
+
+.disc--flipping::before {
+  transform: rotateY(0deg);
+}
+
+.disc--flipping::after {
+  transform: rotateY(180deg);
+}
+
+.disc--flipping.disc--black::before,
+.disc--flipping.disc--white::after {
+  background: radial-gradient(circle at 32% 28%, #555, #111 55%, #000);
+  box-shadow:
+    inset 2px 2px 4px rgba(255, 255, 255, 0.12),
+    inset -2px -3px 5px rgba(0, 0, 0, 0.5),
+    0 2px 4px rgba(0, 0, 0, 0.35);
+}
+
+.disc--flipping.disc--white::before,
+.disc--flipping.disc--black::after {
+  background: radial-gradient(circle at 32% 28%, #fff, #e8e8e8 55%, #c8c8c8);
+  box-shadow:
+    inset 2px 2px 4px rgba(255, 255, 255, 0.9),
+    inset -2px -3px 5px rgba(0, 0, 0, 0.15),
+    0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
 .disc--black {
@@ -548,6 +594,16 @@
   }
 }
 
+@keyframes disc-flip {
+  from {
+    transform: rotateY(180deg);
+  }
+
+  to {
+    transform: rotateY(0deg);
+  }
+}
+
 @media (max-width: 420px) {
   .game-controls,
   .install-panel,
@@ -599,6 +655,8 @@ input:focus-visible,
   .cell,
   .new-game-button,
   .disc,
+  .disc--placing,
+  .disc--flipping,
   .disc--recent,
   .hint {
     animation: none;

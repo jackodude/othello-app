@@ -1,5 +1,9 @@
 import type { Cell, Player, Position } from '../game';
-import { isPositionListed } from '../hooks/gamePresentation';
+import {
+  indexToPosition,
+  isPositionListed,
+  type LastMove,
+} from '../hooks/gamePresentation';
 
 interface BoardProps {
   board: readonly (readonly Cell[])[];
@@ -11,6 +15,8 @@ interface BoardProps {
   showLegalMoveIndicators: boolean;
   recentPositions: readonly Position[];
   animateChanges: boolean;
+  animationPhase: 'idle' | 'placing' | 'flipping';
+  lastMove: LastMove | null;
 }
 
 function isLegalMoveAt(
@@ -31,7 +37,15 @@ export function Board({
   showLegalMoveIndicators,
   recentPositions,
   animateChanges,
+  animationPhase,
+  lastMove,
 }: BoardProps) {
+  const placedPosition = lastMove ? indexToPosition(lastMove.placedIndex) : null;
+  const flippedPositions =
+    lastMove?.flippedIndices
+      .map(indexToPosition)
+      .filter((position): position is Position => position !== null) ?? [];
+
   return (
     <div className="board" role="grid" aria-label="Othello board">
       {board.map((row, rowIndex) =>
@@ -41,6 +55,13 @@ export function Board({
           const shouldShowLegalHint =
             showLegalMoveIndicators && isPlayableLegalMove;
           const isRecent = isPositionListed(recentPositions, rowIndex, colIndex);
+          const isPlacedDisc =
+            placedPosition?.row === rowIndex && placedPosition.col === colIndex;
+          const isFlippedDisc = isPositionListed(flippedPositions, rowIndex, colIndex);
+          const shouldAnimatePlacement =
+            animateChanges && animationPhase === 'flipping' && isPlacedDisc;
+          const shouldAnimateFlip =
+            animateChanges && animationPhase === 'flipping' && isFlippedDisc;
           const cellLabel = cell
             ? `${cell} disc${isRecent ? ', changed on the last move' : ''}`
             : isPlayableLegalMove
@@ -57,7 +78,9 @@ export function Board({
                 isPlayableLegalMove ? 'cell--legal' : '',
                 shouldShowLegalHint ? 'cell--hinted' : '',
                 isRecent ? 'cell--recent' : '',
-                animateChanges ? 'cell--animated' : '',
+                animateChanges && isRecent ? 'cell--animated' : '',
+                shouldAnimatePlacement ? 'cell--placing' : '',
+                shouldAnimateFlip ? 'cell--flipping' : '',
               ]
                 .filter(Boolean)
                 .join(' ')}
@@ -72,7 +95,9 @@ export function Board({
                     'disc',
                     `disc--${cell}`,
                     isRecent ? 'disc--recent' : '',
-                    animateChanges ? 'disc--animated' : '',
+                    animateChanges && isRecent ? 'disc--animated' : '',
+                    shouldAnimatePlacement ? 'disc--placing' : '',
+                    shouldAnimateFlip ? 'disc--flipping' : '',
                   ]
                     .filter(Boolean)
                     .join(' ')}

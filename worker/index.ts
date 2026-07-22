@@ -7,6 +7,7 @@ import {
   applyMove,
   BOARD_SIZE,
   createInitialGameState,
+  getAllFlips,
   getGameResult,
   getScores,
   resolveTurnState,
@@ -20,8 +21,16 @@ interface GameRecord {
   readonly version: number;
   readonly playerColor?: Player;
   readonly opponentJoined: boolean;
+  readonly lastMove: LastMove | null;
   readonly playerToken?: string;
   readonly invitation?: string;
+}
+
+interface LastMove {
+  readonly version: number;
+  readonly player: Player;
+  readonly placedIndex: number;
+  readonly flippedIndices: readonly number[];
 }
 
 interface MoveRequest {
@@ -68,6 +77,10 @@ interface GameRow {
   readonly black_invite_token_digest: string | null;
   readonly black_invite_created_at: string | null;
   readonly black_invite_claimed_at: string | null;
+  readonly last_move_version?: number | null;
+  readonly last_move_player?: string | null;
+  readonly last_move_placed_index?: number | null;
+  readonly last_move_flipped_indices_json?: string | null;
 }
 
 interface StoredGame {
@@ -87,6 +100,7 @@ interface StoredGame {
   readonly rematchOfGameId: string | null;
   readonly blackJoined: boolean;
   readonly blackInviteTokenDigest: string;
+  readonly lastMove: LastMove | null;
 }
 
 interface WorkerEnv extends Env {
@@ -153,6 +167,7 @@ function toGameRecord(
         : playerColor === 'black'
           ? game.whiteJoined
           : game.blackJoined && game.whiteJoined,
+    lastMove: game.lastMove,
     ...extras,
   };
 }
@@ -261,6 +276,84 @@ function parseBoard(value: string): Board | null {
   return board;
 }
 
+function positionToIndex(position: Position): number {
+  return position.row * BOARD_SIZE + position.col;
+}
+
+function parseLastMove(row: GameRow): LastMove | null {
+  const hasLastMoveColumns =
+    row.last_move_version !== undefined ||
+    row.last_move_player !== undefined ||
+    row.last_move_placed_index !== undefined ||
+    row.last_move_flipped_indices_json !== undefined;
+
+  if (!hasLastMoveColumns) {
+    return null;
+  }
+
+  if (
+    row.last_move_version === null ||
+    row.last_move_player === null ||
+    row.last_move_placed_index === null ||
+    row.last_move_flipped_indices_json === null ||
+    row.last_move_version === undefined ||
+    row.last_move_player === undefined ||
+    row.last_move_placed_index === undefined ||
+    row.last_move_flipped_indices_json === undefined
+  ) {
+    return null;
+  }
+
+  if (
+    typeof row.last_move_version !== 'number' ||
+    !Number.isInteger(row.last_move_version) ||
+    row.last_move_version < 2 ||
+    row.last_move_version > row.version ||
+    !isPlayer(row.last_move_player) ||
+    typeof row.last_move_placed_index !== 'number' ||
+    !Number.isInteger(row.last_move_placed_index) ||
+    row.last_move_placed_index < 0 ||
+    row.last_move_placed_index >= BOARD_SIZE * BOARD_SIZE ||
+    typeof row.last_move_flipped_indices_json !== 'string'
+  ) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.last_move_flipped_indices_json);
+  } catch {
+    return null;
+  }
+
+  if (!Array.isArray(parsed)) {
+    return null;
+  }
+
+  const flippedIndices: number[] = [];
+  const seenIndices = new Set<number>();
+  for (const value of parsed) {
+    if (
+      typeof value !== 'number' ||
+      !Number.isInteger(value) ||
+      value < 0 ||
+      value >= BOARD_SIZE * BOARD_SIZE ||
+      seenIndices.has(value)
+    ) {
+      return null;
+    }
+    seenIndices.add(value);
+    flippedIndices.push(value);
+  }
+
+  return {
+    version: row.last_move_version,
+    player: row.last_move_player,
+    placedIndex: row.last_move_placed_index,
+    flippedIndices,
+  };
+}
+
 function rowToStoredGame(row: GameRow): StoredGame | null {
   if (
     typeof row.id !== 'string' ||
@@ -342,6 +435,7 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
     rematchOfGameId: row.rematch_of_game_id ?? null,
     blackJoined: row.black_joined === undefined ? true : row.black_joined === 1,
     blackInviteTokenDigest: row.black_invite_token_digest ?? '',
+    lastMove: parseLastMove(row),
   };
 }
 
@@ -472,7 +566,9 @@ async function getGameByJoinCode(
               white_joined, black_player_created_at, white_invite_created_at,
               white_invite_claimed_at, white_player_created_at,
               rematch_of_game_id, black_joined, black_invite_token_digest,
-              black_invite_created_at, black_invite_claimed_at
+              black_invite_created_at, black_invite_claimed_at,
+              last_move_version, last_move_player, last_move_placed_index,
+              last_move_flipped_indices_json
        FROM games
        WHERE join_code = ?`,
     )
@@ -547,8 +643,10 @@ async function insertGame(
           black_player_created_at, white_invite_created_at,
           white_invite_claimed_at, white_player_created_at,
           rematch_of_game_id, black_joined, black_invite_token_digest,
-          black_invite_created_at, black_invite_claimed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          black_invite_created_at, black_invite_claimed_at,
+          last_move_version, last_move_player, last_move_placed_index,
+          last_move_flipped_indices_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         id,
@@ -575,6 +673,10 @@ async function insertGame(
         blackJoined ? 1 : 0,
         blackInviteTokenDigest,
         blackInviteTokenDigest ? now : null,
+        null,
+        null,
+        null,
+        null,
         null,
       )
       .run();
@@ -1047,6 +1149,7 @@ async function persistMove(
   db: D1Database,
   game: StoredGame,
   nextState: GameState,
+  lastMove: LastMove,
 ): Promise<boolean> {
   const fields = gameStateToStorageFields(nextState);
   const updatedAt = new Date().toISOString();
@@ -1063,6 +1166,10 @@ async function persistMove(
            white_score = ?,
            consecutive_passes = ?,
            version = ?,
+           last_move_version = ?,
+           last_move_player = ?,
+           last_move_placed_index = ?,
+           last_move_flipped_indices_json = ?,
            updated_at = ?
        WHERE id = ? AND join_code = ? AND version = ?`,
     )
@@ -1075,6 +1182,10 @@ async function persistMove(
       fields.whiteScore,
       fields.consecutivePasses,
       nextVersion,
+      lastMove.version,
+      lastMove.player,
+      lastMove.placedIndex,
+      JSON.stringify(lastMove.flippedIndices),
       updatedAt,
       game.id,
       game.joinCode,
@@ -1179,13 +1290,20 @@ async function handleMove(
   }
 
   const move: Position = { row: moveRequest.row, col: moveRequest.col };
+  const flips = getAllFlips(game.state.board, move, playerColor);
   const nextState = applyMove(game.state, move);
 
   if (!nextState) {
     return errorResponse(422, 'Illegal move');
   }
 
-  const didPersist = await persistMove(db, game, nextState);
+  const lastMove: LastMove = {
+    version: game.version + 1,
+    player: playerColor,
+    placedIndex: positionToIndex(move),
+    flippedIndices: flips.map(positionToIndex),
+  };
+  const didPersist = await persistMove(db, game, nextState, lastMove);
   if (!didPersist) {
     return errorResponse(409, 'Stale game version');
   }

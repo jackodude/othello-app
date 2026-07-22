@@ -39,6 +39,20 @@ interface BeforeInstallPromptEvent extends Event {
 }
 
 function App() {
+  const [preferences, setPreferences] = useState(() => {
+    if (typeof window === 'undefined') {
+      return DEFAULT_GAME_PREFERENCES;
+    }
+
+    return loadGamePreferences(window.localStorage);
+  });
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) {
+      return false;
+    }
+
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  });
   const {
     gameState,
     joinCode,
@@ -64,7 +78,12 @@ function App() {
     errorKind,
     syncWarningMessage,
     recentPositions,
-  } = useGame();
+    animationPhase,
+    lastMove,
+    isAnimatingMove,
+  } = useGame({
+    animateMoves: preferences.animateDiscChanges && !prefersReducedMotion,
+  });
   const [invitationInput, setInvitationInput] = useState('');
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -94,14 +113,6 @@ function App() {
     });
   const [isNotificationBusy, setIsNotificationBusy] = useState(false);
   const [notificationMessage, setNotificationMessage] = useState<string | null>(null);
-  const [preferences, setPreferences] = useState(() => {
-    if (typeof window === 'undefined') {
-      return DEFAULT_GAME_PREFERENCES;
-    }
-
-    return loadGamePreferences(window.localStorage);
-  });
-
   useEffect(() => {
     function handleBeforeInstallPrompt(event: Event) {
       event.preventDefault();
@@ -130,6 +141,24 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!window.matchMedia) {
+      return;
+    }
+
+    const mediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+    function handleMotionPreferenceChange() {
+      setPrefersReducedMotion(mediaQuery.matches);
+    }
+
+    mediaQuery.addEventListener('change', handleMotionPreferenceChange);
+
+    return () => {
+      mediaQuery.removeEventListener('change', handleMotionPreferenceChange);
+    };
+  }, []);
+
   function handleJoinSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     void claimWhiteFromInvitation(invitationInput);
@@ -143,7 +172,7 @@ function App() {
     isSubmittingMove,
     isLoading,
   });
-  const boardDisabled = !showLegalMoves;
+  const boardDisabled = !showLegalMoves || isAnimatingMove;
   const showVisualLegalMoves = shouldShowVisualLegalMoves(
     showLegalMoves,
     preferences,
@@ -597,6 +626,8 @@ function App() {
             showLegalMoveIndicators={showVisualLegalMoves}
             recentPositions={visibleRecentPositions}
             animateChanges={preferences.animateDiscChanges}
+            animationPhase={animationPhase}
+            lastMove={lastMove}
           />
         </>
       ) : (
