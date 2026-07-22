@@ -26,7 +26,11 @@ import {
   type PushPermissionState,
 } from './hooks/pushNotifications';
 import { getRelativeStatusMessage } from './hooks/gamePresentation';
-import { shouldShowInvitationPanel, shouldShowLegalMoves } from './hooks/gameUiState';
+import {
+  shouldShowInvitationPanel,
+  shouldShowLegalMoves,
+  shouldShowRematchButton,
+} from './hooks/gameUiState';
 import { useGame } from './hooks/useGame';
 import './App.css';
 
@@ -48,12 +52,14 @@ function App() {
     result,
     playMove,
     startNewGame,
+    createRematch,
     claimWhiteFromInvitation,
     switchGame,
     hasSelectedGame,
     showGameSelection,
     isLoading,
     isSubmittingMove,
+    isCreatingRematch,
     errorMessage,
     errorKind,
     syncWarningMessage,
@@ -569,6 +575,17 @@ function App() {
             statusMessage={statusMessage}
             isSubmittingMove={isSubmittingMove}
           />
+
+          {shouldShowRematchButton(isAuthenticated, gameState.status) && (
+            <button
+              type="button"
+              className="new-game-button"
+              disabled={isCreatingRematch}
+              onClick={() => void createRematch()}
+            >
+              {isCreatingRematch ? 'Creating rematch...' : 'Play Again'}
+            </button>
+          )}
 
           <Board
             board={gameState.board}

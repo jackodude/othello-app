@@ -130,6 +130,18 @@ async function submitMove(
   );
 }
 
+async function createRematchGame(
+  joinCode: string,
+  playerToken: string,
+): Promise<GameRecord> {
+  return readGameResponse(
+    await fetch(`/api/games/${encodeURIComponent(normalizeJoinCode(joinCode))}/rematch`, {
+      method: 'POST',
+      headers: authorizationHeaders(playerToken),
+    }),
+  );
+}
+
 function getErrorKind(error: unknown): GameErrorKind {
   if (error instanceof Error && error.name === 'UnauthorizedError') {
     return 'unauthorized';
@@ -150,6 +162,7 @@ export function useGame() {
   });
   const [isLoading, setIsLoading] = useState(() => readStoredJoinCode() !== null);
   const [isSubmittingMove, setIsSubmittingMove] = useState(false);
+  const [isCreatingRematch, setIsCreatingRematch] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [errorKind, setErrorKind] = useState<GameErrorKind | null>(null);
   const [syncWarningMessage, setSyncWarningMessage] = useState<string | null>(null);
@@ -417,6 +430,37 @@ export function useGame() {
     }
   }, [applyAuthenticatedGame]);
 
+  const createRematch = useCallback(async () => {
+    if (!game || !selectedJoinCode || !playerToken || game.state.status !== 'finished') {
+      return;
+    }
+
+    setIsCreatingRematch(true);
+    setErrorMessage(null);
+    setErrorKind(null);
+
+    try {
+      const rematch = await createRematchGame(selectedJoinCode, playerToken);
+      if (!rematch.playerToken) {
+        throw new Error('Missing player token');
+      }
+      applyAuthenticatedGame(rematch, rematch.playerToken);
+    } catch (error) {
+      const kind = getErrorKind(error);
+      setErrorKind(kind);
+      setErrorMessage(
+        kind === 'unauthorized'
+          ? 'Player credential is no longer valid.'
+          : 'Unable to create a rematch.',
+      );
+      if (kind === 'unauthorized') {
+        setPlayerToken(null);
+      }
+    } finally {
+      setIsCreatingRematch(false);
+    }
+  }, [applyAuthenticatedGame, game, playerToken, selectedJoinCode]);
+
   const claimWhite = useCallback(
     async (joinCode: string, inviteToken: string) => {
       const normalizedCode = normalizeJoinCode(joinCode);
@@ -501,6 +545,7 @@ export function useGame() {
     result,
     playMove,
     startNewGame,
+    createRematch,
     loadGame,
     claimWhite,
     claimWhiteFromInvitation,
@@ -510,6 +555,7 @@ export function useGame() {
     showGameSelection: !game || isSwitchingGame,
     isLoading,
     isSubmittingMove,
+    isCreatingRematch,
     errorMessage,
     errorKind,
     syncWarningMessage,

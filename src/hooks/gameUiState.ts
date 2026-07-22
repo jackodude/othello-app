@@ -47,3 +47,10 @@ export function shouldShowJoinControls(
 ): boolean {
   return !hasSelectedGame || isSwitchingGame;
 }
+
+export function shouldShowRematchButton(
+  isAuthenticated: boolean,
+  gameStatus: GameStatus,
+): boolean {
+  return isAuthenticated && gameStatus === 'finished';
+}

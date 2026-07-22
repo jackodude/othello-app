@@ -216,6 +216,11 @@ class FakeD1PreparedStatement {
         inviteCreatedAt,
         inviteClaimedAt,
         whiteCreatedAt,
+        rematchOfGameId,
+        blackJoined,
+        blackInviteDigest,
+        blackInviteCreatedAt,
+        blackInviteClaimedAt,
       ] = this.params;
       const code = String(joinCode);
 
@@ -244,6 +249,11 @@ class FakeD1PreparedStatement {
         white_invite_created_at: inviteCreatedAt,
         white_invite_claimed_at: inviteClaimedAt,
         white_player_created_at: whiteCreatedAt,
+        rematch_of_game_id: rematchOfGameId,
+        black_joined: blackJoined,
+        black_invite_token_digest: blackInviteDigest,
+        black_invite_created_at: blackInviteCreatedAt,
+        black_invite_claimed_at: blackInviteClaimedAt,
       });
 
       return makeD1Result(1);
@@ -273,6 +283,35 @@ class FakeD1PreparedStatement {
         version: nextVersion,
         white_invite_claimed_at: this.params[2],
         white_player_created_at: this.params[3],
+        updated_at: this.params[4],
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (this.sql.includes('black_player_token_digest') && this.sql.includes('black_joined = 0')) {
+      const blackDigest = this.params[0];
+      const nextVersion = this.params[1];
+      const joinCode = String(this.params[6]);
+      const inviteDigest = this.params[7];
+      const row = this.db.rowsByCode.get(joinCode);
+
+      if (
+        !row ||
+        row.black_joined !== 0 ||
+        row.black_invite_token_digest !== inviteDigest
+      ) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(joinCode, {
+        ...row,
+        black_player_token_digest: blackDigest,
+        black_invite_token_digest: null,
+        black_joined: 1,
+        version: nextVersion,
+        black_invite_claimed_at: this.params[2],
+        black_player_created_at: this.params[3],
         updated_at: this.params[4],
       });
 
@@ -448,6 +487,26 @@ function mockJoinCodes(codes: readonly string[]) {
 function splitInvitation(invitation: string) {
   const [joinCode, inviteToken] = invitation.split(':', 2);
   return { joinCode, inviteToken };
+}
+
+function finishGame(db: FakeD1Database, joinCode: string) {
+  const row = db.rowsByCode.get(joinCode);
+  if (!row) {
+    throw new Error(`Missing game ${joinCode}`);
+  }
+
+  const board = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => 'black'));
+  db.rowsByCode.set(joinCode, {
+    ...row,
+    board_json: JSON.stringify(board),
+    current_player: 'black',
+    status: 'finished',
+    winner: 'black',
+    black_score: 64,
+    white_score: 0,
+    consecutive_passes: 0,
+    updated_at: new Date().toISOString(),
+  });
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -716,6 +775,76 @@ describe('authenticated game API', () => {
     ).toBe(second.body.id);
   });
 
+  it('rejects rematches for unauthenticated, non-player, and unfinished requests', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const first = await fetchJson(env, '/api/games', { method: 'POST' });
+    const second = await fetchJson(env, '/api/games', { method: 'POST' });
+
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/rematch', { method: 'POST' }))
+        .response.status,
+    ).toBe(401);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/rematch', {
+        method: 'POST',
+        headers: auth(second.body.playerToken),
+      })).response.status,
+    ).toBe(401);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/rematch', {
+        method: 'POST',
+        headers: auth(first.body.playerToken),
+      })).response.status,
+    ).toBe(409);
+  });
+
+  it('creates an immutable linked rematch with swapped colours from White', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const created = await fetchJson(env, '/api/games', { method: 'POST' });
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    const white = await joinWhite(env, joinCode, inviteToken);
+    finishGame(db, joinCode);
+    const original = { ...db.rowsByCode.get(joinCode)! };
+
+    const rematch = await fetchJson(env, '/api/games/ABCDEF/rematch', {
+      method: 'POST',
+      headers: auth(white.body.playerToken),
+    });
+
+    expect(rematch.response.status).toBe(201);
+    expect(rematch.body.joinCode).toBe('GHJKLM');
+    expect(rematch.body.playerColor).toBe('black');
+    expect(rematch.body.playerToken).toBeTruthy();
+    expect(rematch.body.invitation).toContain('GHJKLM:');
+    expect(rematch.body.state?.status).toBe('playing');
+    expect(db.rowsByCode.get(joinCode)).toEqual(original);
+    expect(db.rowsByCode.get('GHJKLM')?.rematch_of_game_id).toBe(created.body.id);
+  });
+
+  it('creates an immutable linked rematch with swapped colours from Black', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const created = await fetchJson(env, '/api/games', { method: 'POST' });
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(env, joinCode, inviteToken);
+    finishGame(db, joinCode);
+    const original = { ...db.rowsByCode.get(joinCode)! };
+
+    const rematch = await fetchJson(env, '/api/games/ABCDEF/rematch', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+    });
+
+    expect(rematch.response.status).toBe(201);
+    expect(rematch.body.joinCode).toBe('GHJKLM');
+    expect(rematch.body.playerColor).toBe('white');
+    expect(rematch.body.opponentJoined).toBe(false);
+    expect(rematch.body.invitation).toContain('GHJKLM:');
+    expect(db.rowsByCode.get(joinCode)).toEqual(original);
+    expect(db.rowsByCode.get('GHJKLM')?.rematch_of_game_id).toBe(created.body.id);
+    expect(db.rowsByCode.get('GHJKLM')?.black_joined).toBe(0);
+    expect(db.rowsByCode.get('GHJKLM')?.white_joined).toBe(1);
+  });
+
   it('requires push configuration for subscription creation', async () => {
     const created = await createGame(env);
 
@@ -817,6 +946,9 @@ describe('authenticated game API', () => {
       whitePlayerTokenDigest: null,
       whiteInviteTokenDigest: String(game.white_invite_token_digest),
       whiteJoined: false,
+      rematchOfGameId: null,
+      blackJoined: true,
+      blackInviteTokenDigest: '',
     };
     const updatedGame = { ...previousGame, version: 2, whiteJoined: true };
 
@@ -851,6 +983,9 @@ describe('authenticated game API', () => {
       whitePlayerTokenDigest: 'white',
       whiteInviteTokenDigest: '',
       whiteJoined: true,
+      rematchOfGameId: null,
+      blackJoined: true,
+      blackInviteTokenDigest: '',
     };
     db.pushSubscriptions.push({
       id: 'sub-1',
@@ -895,6 +1030,9 @@ describe('authenticated game API', () => {
       whitePlayerTokenDigest: 'white',
       whiteInviteTokenDigest: '',
       whiteJoined: true,
+      rematchOfGameId: null,
+      blackJoined: true,
+      blackInviteTokenDigest: '',
     };
     db.pushNotificationEvents.push({
       id: 'event-1',

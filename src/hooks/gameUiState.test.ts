@@ -4,6 +4,7 @@ import {
   shouldShowInvitationPanel,
   shouldShowJoinControls,
   shouldShowLegalMoves,
+  shouldShowRematchButton,
 } from './gameUiState';
 
 const legalMoveBase = {
@@ -62,5 +63,11 @@ describe('game UI state', () => {
   it('hides join controls for an authenticated active game until switching', () => {
     expect(shouldShowJoinControls(true, false)).toBe(false);
     expect(shouldShowJoinControls(true, true)).toBe(true);
+  });
+
+  it('shows rematch only for authenticated finished games', () => {
+    expect(shouldShowRematchButton(true, 'finished')).toBe(true);
+    expect(shouldShowRematchButton(false, 'finished')).toBe(false);
+    expect(shouldShowRematchButton(true, 'playing')).toBe(false);
   });
 });
