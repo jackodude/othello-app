@@ -33,6 +33,25 @@
   gap: 0.75rem;
 }
 
+.connection-status {
+  width: min(100%, 26rem);
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.error-message {
+  width: min(100%, 26rem);
+  margin: 0;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid #ef4444;
+  border-radius: 0.5rem;
+  color: #b91c1c;
+  background: #fee2e2;
+  font-size: 0.9rem;
+  text-align: center;
+}
+
 .scoreboard {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -214,6 +233,12 @@
 
 .new-game-button:active {
   transform: translateY(1px);
+}
+
+.new-game-button:disabled {
+  cursor: default;
+  filter: grayscale(0.3);
+  opacity: 0.7;
 }
 
 @keyframes disc-place {

@@ -9,6 +9,6 @@ export default defineConfig(({ mode }) => ({
   plugins: mode === 'test' ? [react()] : [react(), cloudflare()],
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'worker/**/*.test.ts'],
   },
 }))
