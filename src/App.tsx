@@ -44,14 +44,11 @@ function App() {
     opponentJoined,
     isAuthenticated,
     isYourTurn,
-    version,
     scores,
     result,
     playMove,
     startNewGame,
-    loadGame,
     claimWhiteFromInvitation,
-    clearCredential,
     switchGame,
     hasSelectedGame,
     showGameSelection,
@@ -62,9 +59,9 @@ function App() {
     syncWarningMessage,
     recentPositions,
   } = useGame();
-  const [joinCodeInput, setJoinCodeInput] = useState(() => joinCode ?? '');
   const [invitationInput, setInvitationInput] = useState('');
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [installPrompt, setInstallPrompt] =
     useState<BeforeInstallPromptEvent | null>(null);
   const [isInstallHelpDismissed, setIsInstallHelpDismissed] = useState(() => {
@@ -126,11 +123,6 @@ function App() {
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
-
-  function handleLoadSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    void loadGame(joinCodeInput);
-  }
 
   function handleJoinSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -344,45 +336,105 @@ function App() {
     <main className="app">
       <header className="header">
         <h1>Othello</h1>
-        <p className="subtitle">Classic Reversi, shared by join code</p>
+        <p className="subtitle">Classic Reversi for two players</p>
       </header>
 
-      <details className="settings-panel">
-        <summary>Settings</summary>
-        <fieldset className="settings-panel__options">
-          <legend>Game preferences</legend>
-          <label className="settings-option">
-            <input
-              type="checkbox"
-              checked={preferences.highlightLastMove}
-              onChange={(event) =>
-                updatePreference('highlightLastMove', event.target.checked)
-              }
-            />
-            <span>Highlight last move</span>
-          </label>
-          <label className="settings-option">
-            <input
-              type="checkbox"
-              checked={preferences.animateDiscChanges}
-              onChange={(event) =>
-                updatePreference('animateDiscChanges', event.target.checked)
-              }
-            />
-            <span>Animate disc changes</span>
-          </label>
-          <label className="settings-option">
-            <input
-              type="checkbox"
-              checked={preferences.showLegalMoveIndicators}
-              onChange={(event) =>
-                updatePreference('showLegalMoveIndicators', event.target.checked)
-              }
-            />
-            <span>Show legal move indicators</span>
-          </label>
-        </fieldset>
-      </details>
+      <div className="top-controls" aria-label="Game controls">
+        <button
+          type="button"
+          className="settings-button"
+          aria-label="Settings"
+          aria-expanded={isSettingsOpen}
+          aria-controls="settings-panel"
+          onClick={() => setIsSettingsOpen((isOpen) => !isOpen)}
+        >
+          <span aria-hidden="true">&#9881;</span>
+        </button>
+        {hasSelectedGame && !showGameSelection && (
+          <button type="button" className="load-game-button" onClick={switchGame}>
+            Switch game
+          </button>
+        )}
+      </div>
+
+      {isSettingsOpen && (
+        <section id="settings-panel" className="settings-panel" aria-label="Settings">
+          <fieldset className="settings-panel__options">
+            <legend>Game preferences</legend>
+            <label className="settings-option">
+              <input
+                type="checkbox"
+                checked={preferences.highlightLastMove}
+                onChange={(event) =>
+                  updatePreference('highlightLastMove', event.target.checked)
+                }
+              />
+              <span>Highlight last move</span>
+            </label>
+            <label className="settings-option">
+              <input
+                type="checkbox"
+                checked={preferences.animateDiscChanges}
+                onChange={(event) =>
+                  updatePreference('animateDiscChanges', event.target.checked)
+                }
+              />
+              <span>Animate disc changes</span>
+            </label>
+            <label className="settings-option">
+              <input
+                type="checkbox"
+                checked={preferences.showLegalMoveIndicators}
+                onChange={(event) =>
+                  updatePreference('showLegalMoveIndicators', event.target.checked)
+                }
+              />
+              <span>Show legal move indicators</span>
+            </label>
+          </fieldset>
+
+          {isAuthenticated && hasSelectedGame && (
+            <div className="notification-panel" aria-label="Push notifications">
+              <div>
+                <strong>Notifications</strong>
+                <p>
+                  {pushState === 'unsupported'
+                    ? 'This browser does not support web push notifications.'
+                    : pushState === 'blocked'
+                      ? 'Notifications are blocked in this browser.'
+                      : pushState === 'enabled'
+                        ? 'Enabled for opponent moves and game updates.'
+                        : 'Get notified when it is your turn.'}
+                </p>
+              </div>
+              {pushState === 'enabled' ? (
+                <button
+                  type="button"
+                  className="load-game-button"
+                  disabled={isNotificationBusy}
+                  onClick={() => void handleDisableNotifications()}
+                >
+                  Disable
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="load-game-button"
+                  disabled={isNotificationBusy || pushState === 'unsupported' || pushState === 'blocked'}
+                  onClick={() => void handleEnableNotifications()}
+                >
+                  Enable
+                </button>
+              )}
+              {notificationMessage && (
+                <span className="notification-panel__message" role="status">
+                  {notificationMessage}
+                </span>
+              )}
+            </div>
+          )}
+        </section>
+      )}
 
       {(canUseNativeInstallPrompt || showIosGuidance) && (
         <section className="install-panel" aria-label="Install Othello">
@@ -417,47 +469,6 @@ function App() {
         </div>
       )}
 
-      {isAuthenticated && hasSelectedGame && (
-        <section className="notification-panel" aria-label="Push notifications">
-          <div>
-            <strong>Notifications</strong>
-            <p>
-              {pushState === 'unsupported'
-                ? 'This browser does not support web push notifications.'
-                : pushState === 'blocked'
-                  ? 'Notifications are blocked in this browser.'
-                  : pushState === 'enabled'
-                    ? 'Enabled for opponent moves and game updates.'
-                    : 'Get notified when it is your turn.'}
-            </p>
-          </div>
-          {pushState === 'enabled' ? (
-            <button
-              type="button"
-              className="load-game-button"
-              disabled={isNotificationBusy}
-              onClick={() => void handleDisableNotifications()}
-            >
-              Disable
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="load-game-button"
-              disabled={isNotificationBusy || pushState === 'unsupported' || pushState === 'blocked'}
-              onClick={() => void handleEnableNotifications()}
-            >
-              Enable
-            </button>
-          )}
-          {notificationMessage && (
-            <span className="notification-panel__message" role="status">
-              {notificationMessage}
-            </span>
-          )}
-        </section>
-      )}
-
       {showGameSelection && (
         <>
           <section className="game-controls" aria-label="Game selection">
@@ -469,29 +480,6 @@ function App() {
             >
               {isLoading ? 'Loading...' : 'New Game'}
             </button>
-
-            <form className="join-form" onSubmit={handleLoadSubmit}>
-              <label className="join-form__label" htmlFor="join-code">
-                Load saved game by join code
-              </label>
-              <div className="join-form__row">
-                <input
-                  id="join-code"
-                  className="join-form__input"
-                  value={joinCodeInput}
-                  onChange={(event) =>
-                    setJoinCodeInput(event.target.value.toUpperCase())
-                  }
-                  maxLength={6}
-                  autoComplete="off"
-                  spellCheck={false}
-                  disabled={isLoading}
-                />
-                <button type="submit" className="load-game-button" disabled={isLoading}>
-                  Load
-                </button>
-              </div>
-            </form>
           </section>
 
           <section className="join-panel" aria-label="Join as White">
@@ -517,31 +505,10 @@ function App() {
         </>
       )}
 
-      <div className="connection-status" aria-live="polite">
-        {isLoading
-          ? 'Loading game...'
-          : hasSelectedGame
-            ? `Code ${joinCode} - Version ${version ?? '-'}`
-            : 'No game selected'}
-      </div>
-
-      {hasSelectedGame && (
-        <section className="identity-panel" aria-label="Player identity">
-          <div className="identity-panel__summary">
-            <strong>
-              {playerColor ? `You are ${playerColor === 'black' ? 'Black' : 'White'}` : 'No player identity'}
-            </strong>
-            <span>{statusMessage}</span>
-          </div>
-          <button type="button" className="load-game-button" onClick={switchGame}>
-            Switch game
-          </button>
-          {errorKind === 'unauthorized' && (
-            <button type="button" className="load-game-button" onClick={clearCredential}>
-              Remove saved credential
-            </button>
-          )}
-        </section>
+      {(isLoading || !hasSelectedGame) && (
+        <div className="connection-status" aria-live="polite">
+          {isLoading ? 'Loading game...' : 'No game selected'}
+        </div>
       )}
 
       {shouldShowInvitationPanel({ playerColor, opponentJoined, invitation }) && (
@@ -567,12 +534,6 @@ function App() {
             </span>
           )}
         </section>
-      )}
-
-      {isSubmittingMove && (
-        <div className="connection-status" aria-live="polite">
-          Submitting move...
-        </div>
       )}
 
       {syncWarningMessage && (
@@ -606,6 +567,7 @@ function App() {
             result={result}
             consecutivePasses={gameState.consecutivePasses}
             statusMessage={statusMessage}
+            isSubmittingMove={isSubmittingMove}
           />
 
           <Board
@@ -623,7 +585,7 @@ function App() {
       ) : (
         <section className="empty-state" aria-live="polite">
           <h2>No game selected</h2>
-          <p>Create a new game, resume with a saved credential, or claim White.</p>
+          <p>Start a new game or paste an invitation.</p>
         </section>
       )}
     </main>

@@ -8,6 +8,7 @@ interface GameStatusProps {
   result: GameResult | null;
   consecutivePasses: number;
   statusMessage: string;
+  isSubmittingMove: boolean;
 }
 
 function formatPlayerName(player: Player): string {
@@ -30,6 +31,7 @@ export function GameStatus({
   result,
   consecutivePasses,
   statusMessage,
+  isSubmittingMove,
 }: GameStatusProps) {
   const absoluteStatus = isFinished
     ? result
@@ -42,7 +44,9 @@ export function GameStatus({
   return (
     <section className="status" aria-live="polite">
       <div className="status__headline">
-        <span className="status__message">{statusMessage}</span>
+        <span className="status__message">
+          {isSubmittingMove ? 'Submitting move...' : statusMessage}
+        </span>
         {playerColor && (
           <span className="status__identity">
             Playing as {formatPlayerName(playerColor)}

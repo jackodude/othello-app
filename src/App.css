@@ -26,6 +26,29 @@
   color: var(--text-secondary);
 }
 
+.top-controls {
+  width: min(100%, 26rem);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.settings-button {
+  appearance: none;
+  width: 2.75rem;
+  height: 2.75rem;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 1.15rem;
+  cursor: pointer;
+}
+
 .status {
   width: min(100%, 26rem);
   display: flex;
@@ -35,25 +58,19 @@
 
 .settings-panel {
   width: min(100%, 26rem);
+  display: grid;
+  gap: 0.85rem;
+  padding: 0.85rem;
   border: 1px solid var(--border);
   border-radius: 0.65rem;
   background: var(--surface);
-}
-
-.settings-panel summary {
-  min-height: 2.5rem;
-  display: flex;
-  align-items: center;
-  padding: 0 0.85rem;
-  font-weight: 700;
-  cursor: pointer;
 }
 
 .settings-panel__options {
   display: grid;
   gap: 0.55rem;
   margin: 0;
-  padding: 0 0.85rem 0.85rem;
+  padding: 0;
   border: none;
 }
 
@@ -123,10 +140,8 @@
 
 .game-controls {
   width: min(100%, 26rem);
-  display: grid;
-  grid-template-columns: auto 1fr;
-  align-items: end;
-  gap: 0.75rem;
+  display: flex;
+  justify-content: center;
 }
 
 .join-form {
@@ -148,9 +163,7 @@
 }
 
 .join-panel,
-.identity-panel,
-.invitation-panel,
-.notification-panel {
+.invitation-panel {
   width: min(100%, 26rem);
   display: flex;
   flex-direction: column;
@@ -161,16 +174,13 @@
   background: var(--surface);
 }
 
-.identity-panel {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: center;
-}
-
 .notification-panel {
   display: grid;
   grid-template-columns: 1fr auto;
   align-items: center;
+  gap: 0.6rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--border);
 }
 
 .notification-panel p {
@@ -184,26 +194,6 @@
   font-size: 0.85rem;
   font-weight: 700;
   color: var(--text-secondary);
-}
-
-.identity-panel__summary {
-  display: flex;
-  flex-direction: column;
-  gap: 0.15rem;
-}
-
-.join-form__input {
-  min-width: 0;
-  height: 2.75rem;
-  border: 1px solid var(--border);
-  border-radius: 0.5rem;
-  padding: 0 0.75rem;
-  background: var(--surface);
-  color: var(--text-primary);
-  font: inherit;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .token-input {
@@ -220,6 +210,7 @@
   appearance: none;
   border: 1px solid var(--border);
   border-radius: 0.5rem;
+  min-height: 2.5rem;
   padding: 0 0.85rem;
   font: inherit;
   font-weight: 700;
@@ -523,7 +514,6 @@
 
 .new-game-button:disabled,
 .load-game-button:disabled,
-.join-form__input:disabled,
 .token-input:disabled {
   cursor: default;
   filter: grayscale(0.3);
@@ -560,7 +550,6 @@
 
 @media (max-width: 420px) {
   .game-controls,
-  .identity-panel,
   .install-panel,
   .notification-panel,
   .join-form__row,
@@ -601,7 +590,7 @@
 
 button:focus-visible,
 input:focus-visible,
-summary:focus-visible {
+.settings-button:focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 3px;
 }
