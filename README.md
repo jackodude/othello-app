@@ -1,3 +1,6 @@
+Consider buying me a coffee to support me :)
+https://buymeacoffee.com/jackmaddocq
+
 # Othello v1.0.0
 
 ### I got fed up of <ins>none</ins> of the Othello / Reversi apps in App Stores working correctly, having cross-platform functionality or allowing people to play at their own pace - **so I built my own!**
