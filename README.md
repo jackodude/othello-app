@@ -1,3 +1,75 @@
+Consider buying me a coffee to support me :)
+https://buymeacoffee.com/jackmaddocq
+
+# Othello v1.0.0
+
+### I got fed up of <ins>none</ins> of the Othello / Reversi apps in App Stores working correctly, having cross-platform functionality or allowing people to play at their own pace - **so I built my own!**
+
+**This is the first public release of my simple Othello (Reversi) web app allowing you to play against friends on Apple (iOS) / Android / Desktop without a time limit!**
+
+**Note - To enable push notifications, 'install' the site as an app on your phone and enable push notifications in the app, and within your phone settings (if disabled by default).**
+
+See how to 'install' as an app below:
++ [Apple / iOS ](https://support.apple.com/en-gb/guide/iphone/iphea86e5236/ios)
++ [Android](https://support.google.com/chrome/answer/9658361?hl=en&co=GENIE.Platform%3DAndroid) (Can be done on any Android browser that supports web apps e.g. Chrome, Brave...etc...)
+
+# Play Now - Access here!
+### [Othello Web App](https://othello-app.jpmaddocks.workers.dev/)
+
+# How To
+
+- Before starting any games, I recommend setting your player name in **Settings > Edit Profile**.
+- Create a game by clicking **New Game** and then sharing the invite code with a friend.
+- They can enter it in the join game box at the top to begin playing against you!
+
+
+## Features
+
+- Async two-player gameplay
+- Passwordless invitations
+- Multiple simultaneous games
+- Player display names
+- Game library
+- Waiting-game cancellation
+- Active-game forfeiting
+- Rematches
+- Home rematch inbox
+- Match statistics
+- Push notifications
+- Progressive Web App (PWA)
+- Disc animations
+- Responsive mobile-first interface
+
+## Built with
+
+- React
+- TypeScript
+- Cloudflare Workers
+- Cloudflare D1
+- Vite
+
+
+## Screenshots
+
+<details>
+  <summary>Image 1 - In-Game Play</summary>
+      <img width="780" height="1634" alt="image" src="https://github.com/user-attachments/assets/aaeef574-f61b-4be5-a471-a58f48deb4c3" />;
+ </details>
+
+<details>
+  <summary>Image 2 - Completed Game</summary>
+<img width="775" height="1652" alt="image" src="https://github.com/user-attachments/assets/2de8adc3-8ab4-4242-b66b-a62e0b8a0326" />;
+ </details>
+
+<details>
+  <summary>Image 3 - Homescreen and Stats</summary>
+<img width="778" height="1575" alt="image" src="https://github.com/user-attachments/assets/85018950-9e3e-4e41-a15e-8675ef90b238" />
+ </details>
+
+
+
+
+# Building your own
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
