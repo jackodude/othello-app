@@ -12,32 +12,21 @@ interface StorageLike {
   readonly removeItem: (key: string) => void;
 }
 
-const PUSH_ENDPOINT_PREFIX = 'othello.pushEndpoint.';
+export const GLOBAL_PUSH_ENDPOINT_KEY = 'othello.pushEndpoint';
 
-export function pushEndpointKey(joinCode: string): string {
-  return `${PUSH_ENDPOINT_PREFIX}${joinCode.trim().toUpperCase()}`;
-}
-
-export function getStoredPushEndpoint(
-  storage: Pick<StorageLike, 'getItem'>,
-  joinCode: string | null,
-): string | null {
-  return joinCode ? storage.getItem(pushEndpointKey(joinCode)) : null;
+export function getStoredPushEndpoint(storage: Pick<StorageLike, 'getItem'>): string | null {
+  return storage.getItem(GLOBAL_PUSH_ENDPOINT_KEY);
 }
 
 export function storePushEndpoint(
   storage: Pick<StorageLike, 'setItem'>,
-  joinCode: string,
   endpoint: string,
 ): void {
-  storage.setItem(pushEndpointKey(joinCode), endpoint);
+  storage.setItem(GLOBAL_PUSH_ENDPOINT_KEY, endpoint);
 }
 
-export function removeStoredPushEndpoint(
-  storage: Pick<StorageLike, 'removeItem'>,
-  joinCode: string,
-): void {
-  storage.removeItem(pushEndpointKey(joinCode));
+export function removeStoredPushEndpoint(storage: Pick<StorageLike, 'removeItem'>): void {
+  storage.removeItem(GLOBAL_PUSH_ENDPOINT_KEY);
 }
 
 export function getPushPermissionState({

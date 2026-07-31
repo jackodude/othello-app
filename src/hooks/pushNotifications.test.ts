@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  GLOBAL_PUSH_ENDPOINT_KEY,
   getPushPermissionState,
   getStoredPushEndpoint,
-  pushEndpointKey,
   removeStoredPushEndpoint,
   storePushEndpoint,
 } from './pushNotifications';
@@ -25,19 +25,19 @@ class MemoryStorage {
 }
 
 describe('push notification helpers', () => {
-  it('scopes stored endpoints by normalized join code', () => {
+  it('stores one global endpoint for the device', () => {
     const storage = new MemoryStorage();
 
-    expect(pushEndpointKey('abc123')).toBe('othello.pushEndpoint.ABC123');
-    expect(getStoredPushEndpoint(storage, 'abc123')).toBeNull();
+    expect(GLOBAL_PUSH_ENDPOINT_KEY).toBe('othello.pushEndpoint');
+    expect(getStoredPushEndpoint(storage)).toBeNull();
 
-    storePushEndpoint(storage, 'abc123', 'https://push.example/sub');
+    storePushEndpoint(storage, 'https://push.example/sub');
 
-    expect(getStoredPushEndpoint(storage, 'ABC123')).toBe('https://push.example/sub');
+    expect(getStoredPushEndpoint(storage)).toBe('https://push.example/sub');
 
-    removeStoredPushEndpoint(storage, 'ABC123');
+    removeStoredPushEndpoint(storage);
 
-    expect(getStoredPushEndpoint(storage, 'ABC123')).toBeNull();
+    expect(getStoredPushEndpoint(storage)).toBeNull();
   });
 
   it('derives permission state without requesting permission', () => {

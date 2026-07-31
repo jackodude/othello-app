@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 
 import { Board } from './components/Board';
@@ -32,6 +32,7 @@ import {
   deriveMatchStats,
   getLibraryStatusLabel,
   isCompletedGame,
+  PLAYER_TOKEN_PREFIX,
   readGameLibraryFilter,
   writeGameLibraryFilter,
   type GameLibraryFilter,
@@ -89,7 +90,6 @@ function App() {
     invitation,
     playerColor,
     opponentName,
-    playerToken,
     opponentJoined,
     isAuthenticated,
     isYourTurn,
@@ -346,7 +346,7 @@ function App() {
   const storedPushEndpoint =
     typeof window === 'undefined'
       ? null
-      : getStoredPushEndpoint(window.localStorage, joinCode ?? null);
+      : getStoredPushEndpoint(window.localStorage);
   const pushState: PushPermissionState = getPushPermissionState({
     isSupported: typeof window !== 'undefined' && isPushSupported(),
     permission: notificationPermission,
@@ -367,8 +367,68 @@ function App() {
     return body.enabled && body.publicKey ? body.publicKey : null;
   }
 
+  const readSavedPlayerToken = useCallback((savedJoinCode: string): string | null => {
+    return window.localStorage.getItem(
+      `${PLAYER_TOKEN_PREFIX}${savedJoinCode.trim().toUpperCase()}`,
+    );
+  }, []);
+
+  const registerSubscriptionForSavedGames = useCallback(async (
+    subscriptionJson: PushSubscriptionJSON,
+  ): Promise<boolean> => {
+    if (savedGames.length === 0) {
+      return true;
+    }
+
+    const registrations = savedGames.map(async (savedGame) => {
+      const savedPlayerToken = readSavedPlayerToken(savedGame.joinCode);
+      if (!savedPlayerToken) {
+        return false;
+      }
+
+      const response = await fetch(
+        `/api/games/${encodeURIComponent(savedGame.joinCode)}/push-subscriptions`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${savedPlayerToken}`,
+          },
+          body: JSON.stringify(subscriptionJson),
+        },
+      );
+
+      return response.ok;
+    });
+
+    const results = await Promise.all(registrations);
+    return results.some(Boolean);
+  }, [readSavedPlayerToken, savedGames]);
+
+  const unregisterSubscriptionForSavedGames = useCallback(async (
+    subscriptionJson: PushSubscriptionJSON,
+  ): Promise<void> => {
+    await Promise.all(
+      savedGames.map(async (savedGame) => {
+        const savedPlayerToken = readSavedPlayerToken(savedGame.joinCode);
+        if (!savedPlayerToken) {
+          return;
+        }
+
+        await fetch(`/api/games/${encodeURIComponent(savedGame.joinCode)}/push-subscriptions`, {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${savedPlayerToken}`,
+          },
+          body: JSON.stringify(subscriptionJson),
+        });
+      }),
+    );
+  }, [readSavedPlayerToken, savedGames]);
+
   async function handleEnableNotifications() {
-    if (!joinCode || !playerToken || !isPushSupported()) {
+    if (!isPushSupported()) {
       return;
     }
 
@@ -395,26 +455,14 @@ function App() {
         applicationServerKey: urlBase64ToArrayBuffer(publicKey),
       });
 
-      const response = await fetch(
-        `/api/games/${encodeURIComponent(joinCode)}/push-subscriptions`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${playerToken}`,
-          },
-          body: JSON.stringify(subscription.toJSON()),
-        },
-      );
-
-      if (!response.ok) {
+      if (!(await registerSubscriptionForSavedGames(subscription.toJSON()))) {
         await subscription.unsubscribe();
         setNotificationMessage('Unable to enable notifications.');
         return;
       }
 
-      storePushEndpoint(window.localStorage, joinCode, subscription.endpoint);
-      setNotificationMessage('Notifications enabled for this game.');
+      storePushEndpoint(window.localStorage, subscription.endpoint);
+      setNotificationMessage('Notifications enabled.');
     } catch {
       setNotificationMessage('Unable to enable notifications.');
     } finally {
@@ -423,7 +471,7 @@ function App() {
   }
 
   async function handleDisableNotifications() {
-    if (!joinCode || !playerToken || !isPushSupported()) {
+    if (!isPushSupported()) {
       return;
     }
 
@@ -434,37 +482,51 @@ function App() {
       const registration = await navigator.serviceWorker.ready;
       const subscription = await registration.pushManager.getSubscription();
       if (subscription) {
-        await fetch(`/api/games/${encodeURIComponent(joinCode)}/push-subscriptions`, {
-          method: 'DELETE',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${playerToken}`,
-          },
-          body: JSON.stringify(subscription.toJSON()),
-        });
+        await unregisterSubscriptionForSavedGames(subscription.toJSON());
         await subscription.unsubscribe();
       } else if (storedPushEndpoint) {
-        await fetch(`/api/games/${encodeURIComponent(joinCode)}/push-subscriptions`, {
-          method: 'DELETE',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${playerToken}`,
-          },
-          body: JSON.stringify({
-            endpoint: storedPushEndpoint,
-            keys: { p256dh: 'unknown', auth: 'unknown' },
-          }),
+        await unregisterSubscriptionForSavedGames({
+          endpoint: storedPushEndpoint,
+          keys: { p256dh: 'unknown', auth: 'unknown' },
         });
       }
 
-      removeStoredPushEndpoint(window.localStorage, joinCode);
-      setNotificationMessage('Notifications disabled for this game.');
+      removeStoredPushEndpoint(window.localStorage);
+      setNotificationMessage('Notifications disabled.');
     } catch {
       setNotificationMessage('Unable to disable notifications.');
     } finally {
       setIsNotificationBusy(false);
     }
   }
+
+  useEffect(() => {
+    if (!storedPushEndpoint || notificationPermission !== 'granted' || !isPushSupported()) {
+      return;
+    }
+
+    let isActive = true;
+
+    async function syncGlobalSubscription() {
+      try {
+        const registration = await navigator.serviceWorker.ready;
+        const subscription = await registration.pushManager.getSubscription();
+        if (!isActive || !subscription) {
+          return;
+        }
+
+        await registerSubscriptionForSavedGames(subscription.toJSON());
+      } catch {
+        // Keep gameplay and the saved preference intact; explicit settings actions report errors.
+      }
+    }
+
+    void syncGlobalSubscription();
+
+    return () => {
+      isActive = false;
+    };
+  }, [notificationPermission, registerSubscriptionForSavedGames, storedPushEndpoint]);
 
   function handleSkipToEnd() {
     if (!window.confirm('Finish this game immediately for testing?')) {
@@ -633,46 +695,44 @@ function App() {
             </button>
           </div>
 
-          {isAuthenticated && hasSelectedGame && (
-            <div className="notification-panel" aria-label="Push notifications">
-              <div>
-                <strong>Notifications</strong>
-                <p>
-                  {pushState === 'unsupported'
-                    ? 'This browser does not support web push notifications.'
-                    : pushState === 'blocked'
-                      ? 'Notifications are blocked in this browser.'
-                      : pushState === 'enabled'
-                        ? 'Enabled for opponent moves and game updates.'
-                        : 'Get notified when it is your turn.'}
-                </p>
-              </div>
-              {pushState === 'enabled' ? (
-                <button
-                  type="button"
-                  className="load-game-button"
-                  disabled={isNotificationBusy}
-                  onClick={() => void handleDisableNotifications()}
-                >
-                  Disable
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="load-game-button"
-                  disabled={isNotificationBusy || pushState === 'unsupported' || pushState === 'blocked'}
-                  onClick={() => void handleEnableNotifications()}
-                >
-                  Enable
-                </button>
-              )}
-              {notificationMessage && (
-                <span className="notification-panel__message" role="status">
-                  {notificationMessage}
-                </span>
-              )}
+          <div className="notification-panel" aria-label="Push notifications">
+            <div>
+              <strong>Notifications</strong>
+              <p>
+                {pushState === 'unsupported'
+                  ? 'This browser does not support web push notifications.'
+                  : pushState === 'blocked'
+                    ? 'Notifications are blocked in this browser.'
+                    : pushState === 'enabled'
+                      ? 'Push notifications are enabled for this device.'
+                      : 'Enable push notifications.'}
+              </p>
             </div>
-          )}
+            {pushState === 'enabled' ? (
+              <button
+                type="button"
+                className="load-game-button"
+                disabled={isNotificationBusy}
+                onClick={() => void handleDisableNotifications()}
+              >
+                Disable
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="load-game-button"
+                disabled={isNotificationBusy || pushState === 'unsupported' || pushState === 'blocked'}
+                onClick={() => void handleEnableNotifications()}
+              >
+                Enable
+              </button>
+            )}
+            {notificationMessage && (
+              <span className="notification-panel__message" role="status">
+                {notificationMessage}
+              </span>
+            )}
+          </div>
         </section>
       )}
 
