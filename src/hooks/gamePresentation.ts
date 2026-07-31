@@ -6,6 +6,9 @@ interface StatusInput {
   readonly playerColor: Player | null;
   readonly opponentJoined: boolean;
   readonly isYourTurn: boolean;
+  readonly opponentName?: string | null;
+  readonly endedReason?: 'normal' | 'forfeit' | 'cancelled';
+  readonly forfeitedBy?: Player | null;
 }
 
 export interface LastMove {
@@ -35,13 +38,33 @@ export function getRelativeStatusMessage({
   playerColor,
   opponentJoined,
   isYourTurn,
+  opponentName,
+  endedReason = 'normal',
+  forfeitedBy = null,
 }: StatusInput): string {
+  const namedOpponent = opponentName || 'Opponent';
   if (gameStatus === 'finished') {
+    if (endedReason === 'cancelled') {
+      return 'Game cancelled';
+    }
+
+    if (endedReason === 'forfeit') {
+      return forfeitedBy === playerColor
+        ? 'You forfeited'
+        : `${namedOpponent} forfeited`;
+    }
+
     if (result === 'draw') {
-      return 'Draw';
+      return opponentName ? `Draw with ${namedOpponent}` : 'Draw';
     }
     if (result && playerColor) {
-      return result === playerColor ? 'You win' : 'You lose';
+      return result === playerColor
+        ? opponentName
+          ? `You defeated ${namedOpponent}`
+          : 'You win'
+        : opponentName
+          ? `${namedOpponent} won`
+          : 'You lose';
     }
     return 'Game complete';
   }
@@ -50,7 +73,7 @@ export function getRelativeStatusMessage({
     return 'Waiting for opponent';
   }
 
-  return isYourTurn ? 'Your turn' : "Opponent's turn";
+  return isYourTurn ? 'Your turn' : `${namedOpponent}'s turn`;
 }
 
 export function getChangedPositions(

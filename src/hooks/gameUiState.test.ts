@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  shouldShowCancelAction,
   shouldShowInvitationPanel,
+  shouldShowForfeitAction,
   shouldShowJoinControls,
   shouldShowLegalMoves,
   shouldShowRematchButton,
+  shouldShowSkipToEndButton,
 } from './gameUiState';
 
 const legalMoveBase = {
@@ -69,5 +72,94 @@ describe('game UI state', () => {
     expect(shouldShowRematchButton(true, 'finished')).toBe(true);
     expect(shouldShowRematchButton(false, 'finished')).toBe(false);
     expect(shouldShowRematchButton(true, 'playing')).toBe(false);
+  });
+
+  it('shows skip-to-end only for authenticated unfinished games when enabled', () => {
+    expect(
+      shouldShowSkipToEndButton({
+        testControlsEnabled: true,
+        isAuthenticated: true,
+        gameStatus: 'playing',
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowSkipToEndButton({
+        testControlsEnabled: false,
+        isAuthenticated: true,
+        gameStatus: 'playing',
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowSkipToEndButton({
+        testControlsEnabled: true,
+        isAuthenticated: true,
+        gameStatus: 'finished',
+      }),
+    ).toBe(false);
+  });
+
+  it('shows forfeit only for authenticated joined unfinished games without terminal actions', () => {
+    expect(
+      shouldShowForfeitAction({
+        isAuthenticated: true,
+        opponentJoined: true,
+        gameStatus: 'playing',
+        isTerminalActionInFlight: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowForfeitAction({
+        isAuthenticated: true,
+        opponentJoined: false,
+        gameStatus: 'playing',
+        isTerminalActionInFlight: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowForfeitAction({
+        isAuthenticated: true,
+        opponentJoined: true,
+        gameStatus: 'finished',
+        isTerminalActionInFlight: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowForfeitAction({
+        isAuthenticated: true,
+        opponentJoined: true,
+        gameStatus: 'playing',
+        isTerminalActionInFlight: true,
+      }),
+    ).toBe(false);
+  });
+
+  it('shows cancel only to Black before an opponent joins', () => {
+    expect(
+      shouldShowCancelAction({
+        isAuthenticated: true,
+        playerColor: 'black',
+        opponentJoined: false,
+        gameStatus: 'playing',
+        isTerminalActionInFlight: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowCancelAction({
+        isAuthenticated: true,
+        playerColor: 'white',
+        opponentJoined: false,
+        gameStatus: 'playing',
+        isTerminalActionInFlight: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowCancelAction({
+        isAuthenticated: true,
+        playerColor: 'black',
+        opponentJoined: true,
+        gameStatus: 'playing',
+        isTerminalActionInFlight: false,
+      }),
+    ).toBe(false);
   });
 });

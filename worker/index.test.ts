@@ -1,12 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createInitialGameState } from '../src/game';
+import { createInitialGameState, getScores } from '../src/game';
 import worker, { deriveNotificationEvent, sendNotificationEvent } from './index';
 
 const API_ORIGIN = 'https://othello.test';
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 type StoredRow = Record<string, unknown>;
+type TestEnv = {
+  readonly DB: D1Database;
+  readonly ENABLE_TEST_CONTROLS?: string;
+  readonly VAPID_PUBLIC_KEY?: string;
+  readonly VAPID_PRIVATE_KEY?: string;
+  readonly VAPID_SUBJECT?: string;
+};
 
 class FakeD1PreparedStatement {
   private params: unknown[] = [];
@@ -47,8 +54,10 @@ class FakeD1PreparedStatement {
       throw new Error(`Unsupported first() SQL: ${this.sql}`);
     }
 
-    const code = String(this.params[0]).toUpperCase();
-    const row = this.db.rowsByCode.get(code);
+    const lookup = String(this.params[0]);
+    const row = this.sql.includes('WHERE id = ?')
+      ? [...this.db.rowsByCode.values()].find((gameRow) => gameRow.id === lookup)
+      : this.db.rowsByCode.get(lookup.toUpperCase());
 
     return row ? ({ ...row } as T) : null;
   }
@@ -225,6 +234,10 @@ class FakeD1PreparedStatement {
         lastMovePlayer,
         lastMovePlacedIndex,
         lastMoveFlippedIndicesJson,
+        blackPlayerName,
+        whitePlayerName,
+        endedReason,
+        forfeitedBy,
       ] = this.params;
       const code = String(joinCode);
 
@@ -262,6 +275,13 @@ class FakeD1PreparedStatement {
         last_move_player: lastMovePlayer,
         last_move_placed_index: lastMovePlacedIndex,
         last_move_flipped_indices_json: lastMoveFlippedIndicesJson,
+        black_player_name: blackPlayerName,
+        white_player_name: whitePlayerName,
+        ended_reason: endedReason,
+        forfeited_by: forfeitedBy,
+        rematch_game_id: null,
+        rematch_requested_by: null,
+        rematch_requested_at: null,
       });
 
       return makeD1Result(1);
@@ -270,8 +290,8 @@ class FakeD1PreparedStatement {
     if (this.sql.includes('white_player_token_digest') && this.sql.includes('white_joined = 0')) {
       const whiteDigest = this.params[0];
       const nextVersion = this.params[1];
-      const joinCode = String(this.params[6]);
-      const inviteDigest = this.params[7];
+      const joinCode = String(this.params[7]);
+      const inviteDigest = this.params[8];
       const row = this.db.rowsByCode.get(joinCode);
 
       if (
@@ -291,7 +311,8 @@ class FakeD1PreparedStatement {
         version: nextVersion,
         white_invite_claimed_at: this.params[2],
         white_player_created_at: this.params[3],
-        updated_at: this.params[4],
+        white_player_name: this.params[4],
+        updated_at: this.params[5],
       });
 
       return makeD1Result(1);
@@ -300,8 +321,8 @@ class FakeD1PreparedStatement {
     if (this.sql.includes('black_player_token_digest') && this.sql.includes('black_joined = 0')) {
       const blackDigest = this.params[0];
       const nextVersion = this.params[1];
-      const joinCode = String(this.params[6]);
-      const inviteDigest = this.params[7];
+      const joinCode = String(this.params[7]);
+      const inviteDigest = this.params[8];
       const row = this.db.rowsByCode.get(joinCode);
 
       if (
@@ -320,7 +341,157 @@ class FakeD1PreparedStatement {
         version: nextVersion,
         black_invite_claimed_at: this.params[2],
         black_player_created_at: this.params[3],
-        updated_at: this.params[4],
+        black_player_name: this.params[4],
+        updated_at: this.params[5],
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (
+      this.sql.includes('UPDATE games') &&
+      (this.sql.includes('black_player_name') ||
+        this.sql.includes('white_player_name')) &&
+      !this.sql.includes('board_json')
+    ) {
+      const displayName = this.params[0];
+      const updatedAt = this.params[1];
+      const id = this.params[2];
+      const joinCode = String(this.params[3]);
+      const currentRow = this.db.rowsByCode.get(joinCode);
+      if (!currentRow || currentRow.id !== id) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(joinCode, {
+        ...currentRow,
+        ...(this.sql.includes('black_player_name')
+          ? { black_player_name: displayName }
+          : { white_player_name: displayName }),
+        updated_at: updatedAt,
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (this.sql.includes('UPDATE games') && this.sql.includes('rematch_game_id')) {
+      const [
+        rematchGameId,
+        rematchRequestedBy,
+        rematchRequestedAt,
+        updatedAt,
+        nextVersion,
+        id,
+        joinCode,
+        expectedStatus,
+        expectedVersion,
+      ] = this.params;
+      const row = this.db.rowsByCode.get(String(joinCode));
+      if (
+        !row ||
+        row.id !== id ||
+        row.status !== expectedStatus ||
+        row.version !== expectedVersion ||
+        row.rematch_game_id
+      ) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(String(joinCode), {
+        ...row,
+        rematch_game_id: rematchGameId,
+        rematch_requested_by: rematchRequestedBy,
+        rematch_requested_at: rematchRequestedAt,
+        updated_at: updatedAt,
+        version: nextVersion,
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (
+      this.sql.includes('UPDATE games') &&
+      this.sql.includes('ended_reason') &&
+      this.sql.includes('white_invite_token_digest = NULL')
+    ) {
+      const [
+        status,
+        version,
+        endedReason,
+        updatedAt,
+        id,
+        joinCode,
+        expectedStatus,
+        expectedVersion,
+      ] = this.params;
+      const row = this.db.rowsByCode.get(String(joinCode));
+      if (
+        !row ||
+        row.id !== id ||
+        row.status !== expectedStatus ||
+        row.version !== expectedVersion ||
+        row.black_joined !== 1 ||
+        row.white_joined !== 0
+      ) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(String(joinCode), {
+        ...row,
+        status,
+        winner: null,
+        version,
+        ended_reason: endedReason,
+        forfeited_by: null,
+        white_invite_token_digest: null,
+        black_invite_token_digest: null,
+        last_move_version: null,
+        last_move_player: null,
+        last_move_placed_index: null,
+        last_move_flipped_indices_json: null,
+        updated_at: updatedAt,
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (this.sql.includes('UPDATE games') && this.sql.includes('ended_reason')) {
+      const [
+        status,
+        winner,
+        version,
+        endedReason,
+        forfeitedBy,
+        updatedAt,
+        id,
+        joinCode,
+        expectedStatus,
+        expectedVersion,
+      ] = this.params;
+      const currentRow = this.db.rowsByCode.get(String(joinCode));
+
+      if (
+        !currentRow ||
+        this.db.forceStaleUpdate ||
+        currentRow.id !== id ||
+        currentRow.status !== expectedStatus ||
+        currentRow.version !== expectedVersion
+      ) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(String(joinCode), {
+        ...currentRow,
+        status,
+        winner,
+        version,
+        ended_reason: endedReason,
+        forfeited_by: forfeitedBy,
+        last_move_version: null,
+        last_move_player: null,
+        last_move_placed_index: null,
+        last_move_flipped_indices_json: null,
+        updated_at: updatedAt,
       });
 
       return makeD1Result(1);
@@ -409,11 +580,14 @@ function makeD1Result(changes: number): D1Result {
   };
 }
 
-function createEnv(db = new FakeD1Database()) {
-  return { DB: db as unknown as D1Database };
+function createEnv(db = new FakeD1Database(), testControlsEnabled = false): TestEnv {
+  return {
+    DB: db as unknown as D1Database,
+    ENABLE_TEST_CONTROLS: testControlsEnabled ? 'true' : undefined,
+  };
 }
 
-function createPushEnv(db = new FakeD1Database()) {
+function createPushEnv(db = new FakeD1Database()): TestEnv {
   return {
     DB: db as unknown as D1Database,
     VAPID_PUBLIC_KEY: 'public-key',
@@ -451,8 +625,25 @@ async function fetchJson(
     readonly version?: number;
     readonly playerColor?: string;
     readonly opponentJoined?: boolean;
+    readonly playerName?: string | null;
+    readonly opponentName?: string | null;
+    readonly winner?: string | null;
+    readonly endedReason?: string | null;
+    readonly forfeitedBy?: string | null;
+    readonly players?: {
+      readonly black?: { readonly name?: string | null };
+      readonly white?: { readonly name?: string | null };
+    };
     readonly playerToken?: string;
     readonly invitation?: string;
+    readonly games?: readonly {
+      readonly joinCode?: string;
+      readonly playerColor?: string;
+      readonly playerName?: string | null;
+      readonly opponentName?: string | null;
+      readonly progress?: number;
+    }[];
+    readonly enabled?: boolean;
     readonly lastMove?: {
       readonly version?: number;
       readonly player?: string;
@@ -564,19 +755,32 @@ async function createValidPushMaterial() {
   };
 }
 
-async function createGame(env: ReturnType<typeof createEnv>, code = 'ABCDEF') {
+async function createGame(
+  env: ReturnType<typeof createEnv>,
+  code = 'ABCDEF',
+  displayName?: string,
+) {
   mockJoinCodes([code]);
-  return fetchJson(env, '/api/games', { method: 'POST' });
+  return fetchJson(env, '/api/games', {
+    method: 'POST',
+    body:
+      displayName === undefined
+        ? undefined
+        : JSON.stringify({ displayName }),
+  });
 }
 
 async function joinWhite(
   env: ReturnType<typeof createEnv>,
   joinCode: string,
   inviteToken: string,
+  displayName?: string,
 ) {
   return fetchJson(env, `/api/games/${joinCode}/join`, {
     method: 'POST',
-    body: JSON.stringify({ inviteToken }),
+    body: JSON.stringify(
+      displayName === undefined ? { inviteToken } : { inviteToken, displayName },
+    ),
   });
 }
 
@@ -623,6 +827,92 @@ describe('authenticated game API', () => {
     expect(joined.body.playerToken).not.toBe(created.body.playerToken);
     expect(joined.body.invitation).toBeUndefined();
     expect(joined.body.opponentJoined).toBe(true);
+  });
+
+  it('stores display names for created and joined players', async () => {
+    const created = await createGame(env, 'ABCDEF', '  Ada   Lovelace  ');
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    const joined = await joinWhite(env, joinCode, inviteToken, 'Grace Hopper');
+
+    expect(created.response.status).toBe(201);
+    expect(created.body.playerName).toBe('Ada Lovelace');
+    expect(created.body.players?.black?.name).toBe('Ada Lovelace');
+    expect(joined.response.status).toBe(200);
+    expect(joined.body.playerName).toBe('Grace Hopper');
+    expect(joined.body.opponentName).toBe('Ada Lovelace');
+
+    const blackRead = await fetchJson(env, `/api/games/${joinCode}`, {
+      headers: auth(created.body.playerToken),
+    });
+    expect(blackRead.body.opponentName).toBe('Grace Hopper');
+    expect(blackRead.body.players?.white?.name).toBe('Grace Hopper');
+  });
+
+  it('rejects invalid display names without rejecting omitted names', async () => {
+    const unnamed = await createGame(env);
+    expect(unnamed.response.status).toBe(201);
+    expect(unnamed.body.playerName).toBeNull();
+
+    const invalidCreate = await fetchJson(env, '/api/games', {
+      method: 'POST',
+      body: JSON.stringify({ displayName: 'x'.repeat(25) }),
+    });
+    expect(invalidCreate.response.status).toBe(400);
+
+    const { joinCode, inviteToken } = splitInvitation(unnamed.body.invitation!);
+    const invalidJoin = await joinWhite(env, joinCode, inviteToken, '   ');
+    expect(invalidJoin.response.status).toBe(400);
+  });
+
+  it('updates only the authenticated player profile and saved-game metadata', async () => {
+    const created = await createGame(env, 'ABCDEF', 'Black Player');
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    const white = await joinWhite(env, joinCode, inviteToken, 'White Player');
+
+    const updated = await fetchJson(env, `/api/games/${joinCode}/player-profile`, {
+      method: 'PATCH',
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({ displayName: 'New Black' }),
+    });
+    expect(updated.response.status).toBe(200);
+    expect(updated.body.playerName).toBe('New Black');
+    expect(updated.body.opponentName).toBe('White Player');
+    expect(updated.body.version).toBe(2);
+
+    const whiteRead = await fetchJson(env, `/api/games/${joinCode}`, {
+      headers: auth(white.body.playerToken),
+    });
+    expect(whiteRead.body.playerName).toBe('White Player');
+    expect(whiteRead.body.opponentName).toBe('New Black');
+
+    const saved = await fetchJson(env, '/api/games/saved', {
+      method: 'POST',
+      body: JSON.stringify({
+        credentials: [
+          { joinCode, playerToken: created.body.playerToken },
+          { joinCode, playerToken: white.body.playerToken },
+        ],
+      }),
+    });
+    expect(saved.response.status).toBe(200);
+    expect(saved.body.games).toHaveLength(1);
+    expect(saved.body.games?.[0].playerName).toBe('New Black');
+    expect(saved.body.games?.[0].opponentName).toBe('White Player');
+    expect(saved.body.games?.[0].progress).toBe(0);
+
+    expect(
+      (await fetchJson(env, `/api/games/${joinCode}/player-profile`, {
+        method: 'PATCH',
+        body: JSON.stringify({ displayName: 'No Auth' }),
+      })).response.status,
+    ).toBe(401);
+    expect(
+      (await fetchJson(env, `/api/games/${joinCode}/player-profile`, {
+        method: 'PATCH',
+        headers: auth(created.body.playerToken),
+        body: JSON.stringify({ displayName: 'x'.repeat(25) }),
+      })).response.status,
+    ).toBe(400);
   });
 
   it('increments the resource version when White joins so Black polling sees it', async () => {
@@ -804,6 +1094,150 @@ describe('authenticated game API', () => {
     expect(read.body.lastMove).toEqual(previousLastMove);
   });
 
+  it('allows Black to forfeit a joined unfinished game and preserves board state', async () => {
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(env, joinCode, inviteToken);
+    const before = { ...db.rowsByCode.get(joinCode)! };
+
+    const forfeited = await fetchJson(env, `/api/games/${joinCode}/forfeit`, {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({
+        winner: 'black',
+        board: Array.from({ length: 8 }, () => []),
+      }),
+    });
+
+    expect(forfeited.response.status).toBe(200);
+    expect(forfeited.body.version).toBe(3);
+    expect(forfeited.body.winner).toBe('white');
+    expect(forfeited.body.endedReason).toBe('forfeit');
+    expect(forfeited.body.forfeitedBy).toBe('black');
+    expect(forfeited.body.lastMove).toBeNull();
+    const row = db.rowsByCode.get(joinCode)!;
+    expect(row.board_json).toBe(before.board_json);
+    expect(row.black_score).toBe(before.black_score);
+    expect(row.white_score).toBe(before.white_score);
+  });
+
+  it('allows White to forfeit and lets either player rematch afterward', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const created = await fetchJson(env, '/api/games', { method: 'POST' });
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    const white = await joinWhite(env, joinCode, inviteToken);
+
+    const forfeited = await fetchJson(env, `/api/games/${joinCode}/forfeit`, {
+      method: 'POST',
+      headers: auth(white.body.playerToken),
+    });
+    expect(forfeited.response.status).toBe(200);
+    expect(forfeited.body.winner).toBe('black');
+    expect(forfeited.body.forfeitedBy).toBe('white');
+
+    const rematch = await fetchJson(env, `/api/games/${joinCode}/rematch`, {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+    });
+    expect(rematch.response.status).toBe(201);
+    expect(rematch.body.joinCode).toBe('GHJKLM');
+    expect(db.rowsByCode.get('GHJKLM')?.rematch_of_game_id).toBe(created.body.id);
+  });
+
+  it('rejects unauthenticated, non-player, waiting, completed, and duplicate forfeits', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const waiting = await fetchJson(env, '/api/games', { method: 'POST' });
+    const other = await fetchJson(env, '/api/games', { method: 'POST' });
+
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/forfeit', { method: 'POST' }))
+        .response.status,
+    ).toBe(401);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/forfeit', {
+        method: 'POST',
+        headers: auth(other.body.playerToken),
+      })).response.status,
+    ).toBe(401);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/forfeit', {
+        method: 'POST',
+        headers: auth(waiting.body.playerToken),
+      })).response.status,
+    ).toBe(409);
+
+    const { joinCode, inviteToken } = splitInvitation(waiting.body.invitation!);
+    await joinWhite(env, joinCode, inviteToken);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/forfeit', {
+        method: 'POST',
+        headers: auth(waiting.body.playerToken),
+      })).response.status,
+    ).toBe(200);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/forfeit', {
+        method: 'POST',
+        headers: auth(waiting.body.playerToken),
+      })).response.status,
+    ).toBe(409);
+  });
+
+  it('lets the creator cancel a waiting game and invalidates the invitation', async () => {
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    const before = { ...db.rowsByCode.get(joinCode)! };
+
+    const cancelled = await fetchJson(env, `/api/games/${joinCode}/cancel`, {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+    });
+
+    expect(cancelled.response.status).toBe(200);
+    expect(cancelled.body.version).toBe(2);
+    expect(cancelled.body.winner).toBeNull();
+    expect(cancelled.body.endedReason).toBe('cancelled');
+    expect(cancelled.body.lastMove).toBeNull();
+    expect(db.rowsByCode.get(joinCode)?.board_json).toBe(before.board_json);
+    expect(db.rowsByCode.get(joinCode)?.white_invite_token_digest).toBeNull();
+    expect(
+      (await joinWhite(env, joinCode, inviteToken)).response.status,
+    ).toBe(403);
+    expect(
+      (await fetchJson(env, `/api/games/${joinCode}/cancel`, {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+      })).response.status,
+    ).toBe(409);
+  });
+
+  it('rejects cancellation after a game is joined or by a non-creator', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const created = await fetchJson(env, '/api/games', { method: 'POST' });
+    const other = await fetchJson(env, '/api/games', { method: 'POST' });
+
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/cancel', {
+        method: 'POST',
+        headers: auth(other.body.playerToken),
+      })).response.status,
+    ).toBe(401);
+
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    const white = await joinWhite(env, joinCode, inviteToken);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/cancel', {
+        method: 'POST',
+        headers: auth(white.body.playerToken),
+      })).response.status,
+    ).toBe(403);
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/cancel', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+      })).response.status,
+    ).toBe(409);
+  });
+
   it('keeps case-insensitive codes and isolated games', async () => {
     mockJoinCodes(['ABCDEF', 'GHJKLM']);
     const first = await fetchJson(env, '/api/games', { method: 'POST' });
@@ -819,6 +1253,109 @@ describe('authenticated game API', () => {
         headers: auth(second.body.playerToken),
       })).body.id,
     ).toBe(second.body.id);
+  });
+
+  it('exposes test-control capability only when explicitly enabled', async () => {
+    expect((await fetchJson(env, '/api/test-controls')).body.enabled).toBe(false);
+
+    const enabledEnv = createEnv(db, true);
+    expect((await fetchJson(enabledEnv, '/api/test-controls')).body.enabled).toBe(true);
+  });
+
+  it('rejects skip-to-end when disabled, unauthenticated, or not a player', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const created = await fetchJson(env, '/api/games', { method: 'POST' });
+    const enabledEnv = createEnv(db, true);
+    const other = await fetchJson(enabledEnv, '/api/games', { method: 'POST' });
+
+    expect(
+      (await fetchJson(env, '/api/games/ABCDEF/test/skip-to-end', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+      })).response.status,
+    ).toBe(404);
+    expect(
+      (await fetchJson(enabledEnv, '/api/games/ABCDEF/test/skip-to-end', {
+        method: 'POST',
+      })).response.status,
+    ).toBe(401);
+    expect(
+      (await fetchJson(enabledEnv, '/api/games/ABCDEF/test/skip-to-end', {
+        method: 'POST',
+        headers: auth(other.body.playerToken),
+      })).response.status,
+    ).toBe(401);
+  });
+
+  it('skips an unfinished game to a deterministic valid ending', async () => {
+    const enabledEnv = createEnv(db, true);
+    const created = await createGame(enabledEnv);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(enabledEnv, joinCode, inviteToken);
+
+    const skipped = await fetchJson(enabledEnv, '/api/games/ABCDEF/test/skip-to-end', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({
+        state: createInitialGameState(),
+        board: Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => null)),
+      }),
+    });
+
+    expect(skipped.response.status).toBe(200);
+    expect(skipped.body.version).toBeGreaterThan(2);
+    expect(skipped.body.state?.status).toBe('finished');
+    expect(skipped.body.state?.board).toEqual(
+      JSON.parse(String(db.rowsByCode.get('ABCDEF')?.board_json)),
+    );
+    expect(getScores(skipped.body.state?.board as ReturnType<typeof createInitialGameState>['board'])).toEqual({
+      black: db.rowsByCode.get('ABCDEF')?.black_score,
+      white: db.rowsByCode.get('ABCDEF')?.white_score,
+    });
+    expect(skipped.body.lastMove?.version).toBe(skipped.body.version);
+
+    const repeatDb = new FakeD1Database();
+    const repeatEnv = createEnv(repeatDb, true);
+    const repeatCreated = await createGame(repeatEnv);
+    const repeatInvite = splitInvitation(repeatCreated.body.invitation!);
+    await joinWhite(repeatEnv, repeatInvite.joinCode, repeatInvite.inviteToken);
+    const repeatSkipped = await fetchJson(
+      repeatEnv,
+      '/api/games/ABCDEF/test/skip-to-end',
+      {
+        method: 'POST',
+        headers: auth(repeatCreated.body.playerToken),
+      },
+    );
+    expect(repeatSkipped.body.state?.board).toEqual(skipped.body.state?.board);
+  });
+
+  it('rejects skip-to-end for completed games and allows rematch afterward', async () => {
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const enabledEnv = createEnv(db, true);
+    const created = await fetchJson(enabledEnv, '/api/games', { method: 'POST' });
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(enabledEnv, joinCode, inviteToken);
+
+    const skipped = await fetchJson(enabledEnv, '/api/games/ABCDEF/test/skip-to-end', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+    });
+    expect(skipped.response.status).toBe(200);
+
+    expect(
+      (await fetchJson(enabledEnv, '/api/games/ABCDEF/test/skip-to-end', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+      })).response.status,
+    ).toBe(409);
+
+    const rematch = await fetchJson(enabledEnv, '/api/games/ABCDEF/rematch', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+    });
+    expect(rematch.response.status).toBe(201);
+    expect(rematch.body.state?.status).toBe('playing');
   });
 
   it('rejects rematches for unauthenticated, non-player, and unfinished requests', async () => {
@@ -864,7 +1401,9 @@ describe('authenticated game API', () => {
     expect(rematch.body.invitation).toContain('GHJKLM:');
     expect(rematch.body.state?.status).toBe('playing');
     expect(rematch.body.lastMove).toBeNull();
-    expect(db.rowsByCode.get(joinCode)).toEqual(original);
+    expect(db.rowsByCode.get(joinCode)?.board_json).toBe(original.board_json);
+    expect(db.rowsByCode.get(joinCode)?.status).toBe(original.status);
+    expect(db.rowsByCode.get(joinCode)?.rematch_requested_by).toBe('white');
     expect(db.rowsByCode.get('GHJKLM')?.rematch_of_game_id).toBe(created.body.id);
   });
 
@@ -887,7 +1426,9 @@ describe('authenticated game API', () => {
     expect(rematch.body.opponentJoined).toBe(false);
     expect(rematch.body.invitation).toContain('GHJKLM:');
     expect(rematch.body.lastMove).toBeNull();
-    expect(db.rowsByCode.get(joinCode)).toEqual(original);
+    expect(db.rowsByCode.get(joinCode)?.board_json).toBe(original.board_json);
+    expect(db.rowsByCode.get(joinCode)?.status).toBe(original.status);
+    expect(db.rowsByCode.get(joinCode)?.rematch_requested_by).toBe('black');
     expect(db.rowsByCode.get('GHJKLM')?.rematch_of_game_id).toBe(created.body.id);
     expect(db.rowsByCode.get('GHJKLM')?.black_joined).toBe(0);
     expect(db.rowsByCode.get('GHJKLM')?.white_joined).toBe(1);
@@ -998,6 +1539,13 @@ describe('authenticated game API', () => {
       blackJoined: true,
       blackInviteTokenDigest: '',
       lastMove: null,
+      blackPlayerName: null,
+      whitePlayerName: null,
+      endedReason: 'normal' as const,
+      forfeitedBy: null,
+      rematchGameId: null,
+      rematchRequestedBy: null,
+      rematchRequestedAt: null,
     };
     const updatedGame = { ...previousGame, version: 2, whiteJoined: true };
 
@@ -1010,6 +1558,95 @@ describe('authenticated game API', () => {
 
     expect(notification?.eventType).toBe('white_joined');
     expect(notification?.recipientPlayerColor).toBe('black');
+  });
+
+  it('derives a winner notification when the opponent forfeits', () => {
+    const previousGame = {
+      id: 'game-1',
+      joinCode: 'ABCDEF',
+      state: createInitialGameState(),
+      version: 2,
+      winner: null,
+      blackScore: 2,
+      whiteScore: 2,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      blackPlayerTokenDigest: 'black',
+      whitePlayerTokenDigest: 'white',
+      whiteInviteTokenDigest: '',
+      whiteJoined: true,
+      rematchOfGameId: null,
+      blackJoined: true,
+      blackInviteTokenDigest: '',
+      lastMove: null,
+      blackPlayerName: 'Alex',
+      whitePlayerName: 'Sam',
+      endedReason: 'normal' as const,
+      forfeitedBy: null,
+      rematchGameId: null,
+      rematchRequestedBy: null,
+      rematchRequestedAt: null,
+    };
+    const updatedGame = {
+      ...previousGame,
+      version: 3,
+      state: { ...previousGame.state, status: 'finished' as const },
+      winner: 'white' as const,
+      endedReason: 'forfeit' as const,
+      forfeitedBy: 'black' as const,
+    };
+
+    const notification = deriveNotificationEvent({
+      previousGame,
+      updatedGame,
+      actorPlayerColor: 'black',
+      eventType: 'forfeit',
+    });
+
+    expect(notification).toEqual({
+      eventType: 'game_finished',
+      recipientPlayerColor: 'white',
+      title: 'Othello game forfeited',
+      body: 'Alex forfeited. You win the game.',
+    });
+  });
+
+  it('generates a rematch request notification for the invited player', async () => {
+    const pushEnv = createPushEnv(db);
+    mockJoinCodes(['ABCDEF', 'GHJKLM']);
+    const created = await fetchJson(pushEnv, '/api/games', {
+      method: 'POST',
+      body: JSON.stringify({ displayName: 'Alex' }),
+    });
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(pushEnv, joinCode, inviteToken, 'Sam');
+    finishGame(db, joinCode);
+    const waitUntilPromises: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil: (promise: Promise<unknown>) => {
+        waitUntilPromises.push(promise);
+      },
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const response = await worker.fetch(
+      request('/api/games/ABCDEF/rematch', {
+        method: 'POST',
+        headers: auth(created.body.playerToken),
+        body: JSON.stringify({ displayName: 'Alex' }),
+      }) as Parameters<typeof worker.fetch>[0],
+      pushEnv,
+      ctx,
+    );
+    await Promise.all(waitUntilPromises);
+
+    const rematchEvents = db.pushNotificationEvents.filter(
+      (event) => event.event_type === 'rematch_requested',
+    );
+    expect(response.status).toBe(201);
+    expect(rematchEvents).toHaveLength(1);
+    expect(rematchEvents[0].recipient_player_color).toBe('white');
   });
 
   it('removes permanently stale subscriptions and records failed delivery state', async () => {
@@ -1036,6 +1673,13 @@ describe('authenticated game API', () => {
       blackJoined: true,
       blackInviteTokenDigest: '',
       lastMove: null,
+      blackPlayerName: null,
+      whitePlayerName: null,
+      endedReason: 'normal' as const,
+      forfeitedBy: null,
+      rematchGameId: null,
+      rematchRequestedBy: null,
+      rematchRequestedAt: null,
     };
     db.pushSubscriptions.push({
       id: 'sub-1',
@@ -1084,6 +1728,13 @@ describe('authenticated game API', () => {
       blackJoined: true,
       blackInviteTokenDigest: '',
       lastMove: null,
+      blackPlayerName: null,
+      whitePlayerName: null,
+      endedReason: 'normal' as const,
+      forfeitedBy: null,
+      rematchGameId: null,
+      rematchRequestedBy: null,
+      rematchRequestedAt: null,
     };
     db.pushNotificationEvents.push({
       id: 'event-1',

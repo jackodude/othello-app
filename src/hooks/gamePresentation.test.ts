@@ -65,6 +65,69 @@ describe('getRelativeStatusMessage', () => {
       }),
     ).toBe('Draw');
   });
+
+  it('uses opponent display names when available', () => {
+    expect(
+      getRelativeStatusMessage({
+        gameStatus: 'playing',
+        result: null,
+        playerColor: 'black',
+        opponentJoined: true,
+        isYourTurn: false,
+        opponentName: 'Grace',
+      }),
+    ).toBe("Grace's turn");
+
+    expect(
+      getRelativeStatusMessage({
+        gameStatus: 'finished',
+        result: 'white',
+        playerColor: 'black',
+        opponentJoined: true,
+        isYourTurn: false,
+        opponentName: 'Grace',
+      }),
+    ).toBe('Grace won');
+  });
+
+  it('uses forfeit messaging without changing normal outcomes', () => {
+    expect(
+      getRelativeStatusMessage({
+        gameStatus: 'finished',
+        result: 'white',
+        playerColor: 'black',
+        opponentJoined: true,
+        isYourTurn: false,
+        opponentName: 'Grace',
+        endedReason: 'forfeit',
+        forfeitedBy: 'black',
+      }),
+    ).toBe('You forfeited');
+
+    expect(
+      getRelativeStatusMessage({
+        gameStatus: 'finished',
+        result: 'white',
+        playerColor: 'white',
+        opponentJoined: true,
+        isYourTurn: false,
+        opponentName: null,
+        endedReason: 'forfeit',
+        forfeitedBy: 'black',
+      }),
+    ).toBe('Opponent forfeited');
+
+    expect(
+      getRelativeStatusMessage({
+        gameStatus: 'finished',
+        result: null,
+        playerColor: 'black',
+        opponentJoined: false,
+        isYourTurn: false,
+        endedReason: 'cancelled',
+      }),
+    ).toBe('Game cancelled');
+  });
 });
 
 describe('getChangedPositions', () => {

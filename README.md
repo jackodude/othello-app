@@ -37,6 +37,19 @@ Configure `VAPID_PUBLIC_KEY` and `VAPID_SUBJECT` as Worker variables in the
 Cloudflare dashboard or Wrangler environment configuration. `VAPID_SUBJECT`
 must be a valid `mailto:` or HTTPS contact value.
 
+## Test controls
+
+The test-only skip-to-end control is disabled unless the Worker variable
+`ENABLE_TEST_CONTROLS` is set to `true`.
+
+For local testing, run Wrangler with that variable in your local environment:
+
+```sh
+ENABLE_TEST_CONTROLS=true npm run dev
+```
+
+Do not configure `ENABLE_TEST_CONTROLS` for normal production gameplay.
+
 Currently, two official plugins are available:
 
 - [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)

@@ -9,6 +9,7 @@ interface GameStatusProps {
   consecutivePasses: number;
   statusMessage: string;
   isSubmittingMove: boolean;
+  opponentName?: string | null;
 }
 
 function formatPlayerName(player: Player): string {
@@ -32,6 +33,7 @@ export function GameStatus({
   consecutivePasses,
   statusMessage,
   isSubmittingMove,
+  opponentName,
 }: GameStatusProps) {
   const absoluteStatus = isFinished
     ? result
@@ -51,6 +53,9 @@ export function GameStatus({
           <span className="status__identity">
             Playing as {formatPlayerName(playerColor)}
           </span>
+        )}
+        {opponentName && (
+          <span className="status__opponent">Playing {opponentName}</span>
         )}
       </div>
       <div className="scoreboard">

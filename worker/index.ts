@@ -9,6 +9,7 @@ import {
   createInitialGameState,
   getAllFlips,
   getGameResult,
+  getOpponent,
   getScores,
   resolveTurnState,
 } from '../src/game';
@@ -24,6 +25,41 @@ interface GameRecord {
   readonly lastMove: LastMove | null;
   readonly playerToken?: string;
   readonly invitation?: string;
+  readonly players: {
+    readonly black: { readonly name: string | null };
+    readonly white: { readonly name: string | null };
+  };
+  readonly playerName?: string | null;
+  readonly opponentName?: string | null;
+  readonly winner: GameResult | null;
+  readonly endedReason: EndedReason;
+  readonly forfeitedBy: Player | null;
+  readonly rematch: RematchRecord | null;
+}
+
+interface RematchRecord {
+  readonly joinCode: string;
+  readonly requestedBy: Player;
+  readonly requestedAt: string | null;
+  readonly waiting: boolean;
+  readonly accepted: boolean;
+}
+
+interface SavedGameRecord {
+  readonly id: string;
+  readonly joinCode: string;
+  readonly state: GameState;
+  readonly version: number;
+  readonly playerColor: Player;
+  readonly opponentJoined: boolean;
+  readonly playerName: string | null;
+  readonly opponentName: string | null;
+  readonly updatedAt: string;
+  readonly progress: number;
+  readonly winner: GameResult | null;
+  readonly endedReason: EndedReason;
+  readonly forfeitedBy: Player | null;
+  readonly rematch: RematchRecord | null;
 }
 
 interface LastMove {
@@ -41,6 +77,22 @@ interface MoveRequest {
 
 interface JoinRequest {
   readonly inviteToken: string;
+  readonly displayName?: string;
+}
+
+interface CreateGameRequest {
+  readonly displayName?: string;
+}
+
+interface PlayerProfileRequest {
+  readonly displayName: string;
+}
+
+interface SavedGamesRequest {
+  readonly credentials: readonly {
+    readonly joinCode: string;
+    readonly playerToken: string;
+  }[];
 }
 
 interface PushSubscriptionRequest {
@@ -81,6 +133,13 @@ interface GameRow {
   readonly last_move_player?: string | null;
   readonly last_move_placed_index?: number | null;
   readonly last_move_flipped_indices_json?: string | null;
+  readonly black_player_name?: string | null;
+  readonly white_player_name?: string | null;
+  readonly ended_reason?: string | null;
+  readonly forfeited_by?: string | null;
+  readonly rematch_game_id?: string | null;
+  readonly rematch_requested_by?: string | null;
+  readonly rematch_requested_at?: string | null;
 }
 
 interface StoredGame {
@@ -101,10 +160,19 @@ interface StoredGame {
   readonly blackJoined: boolean;
   readonly blackInviteTokenDigest: string;
   readonly lastMove: LastMove | null;
+  readonly blackPlayerName: string | null;
+  readonly whitePlayerName: string | null;
+  readonly endedReason: EndedReason;
+  readonly forfeitedBy: Player | null;
+  readonly rematchGameId: string | null;
+  readonly rematchRequestedBy: Player | null;
+  readonly rematchRequestedAt: string | null;
+  readonly rematchGame?: StoredGame | null;
 }
 
 interface WorkerEnv extends Env {
   readonly DB: D1Database;
+  readonly ENABLE_TEST_CONTROLS?: string;
   readonly VAPID_PUBLIC_KEY?: string;
   readonly VAPID_PRIVATE_KEY?: string;
   readonly VAPID_SUBJECT?: string;
@@ -115,8 +183,14 @@ const JOIN_CODE_LENGTH = 6;
 const MAX_JOIN_CODE_ATTEMPTS = 8;
 const TOKEN_BYTE_LENGTH = 32;
 const MAX_NOTIFICATION_ATTEMPTS = 2;
+const MAX_DISPLAY_NAME_LENGTH = 24;
 
-type NotificationEventType = 'white_joined' | 'your_turn' | 'game_finished';
+type EndedReason = 'normal' | 'forfeit' | 'cancelled';
+type NotificationEventType =
+  | 'white_joined'
+  | 'your_turn'
+  | 'game_finished'
+  | 'rematch_requested';
 
 interface NotificationEvent {
   readonly eventType: NotificationEventType;
@@ -150,11 +224,28 @@ function isPushConfigured(env: WorkerEnv): boolean {
   return Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY && env.VAPID_SUBJECT);
 }
 
+function isTestControlsEnabled(env: WorkerEnv): boolean {
+  return env.ENABLE_TEST_CONTROLS === 'true';
+}
+
 function toGameRecord(
   game: StoredGame,
   playerColor?: Player,
   extras?: Pick<GameRecord, 'playerToken' | 'invitation'>,
 ): GameRecord {
+  const playerName =
+    playerColor === 'black'
+      ? game.blackPlayerName
+      : playerColor === 'white'
+        ? game.whitePlayerName
+        : null;
+  const opponentName =
+    playerColor === 'black'
+      ? game.whitePlayerName
+      : playerColor === 'white'
+        ? game.blackPlayerName
+        : null;
+
   return {
     id: game.id,
     joinCode: game.joinCode,
@@ -168,7 +259,71 @@ function toGameRecord(
           ? game.whiteJoined
           : game.blackJoined && game.whiteJoined,
     lastMove: game.lastMove,
+    players: {
+      black: { name: game.blackPlayerName },
+      white: { name: game.whitePlayerName },
+    },
+    playerName,
+    opponentName,
+    winner: game.winner,
+    endedReason: game.endedReason,
+    forfeitedBy: game.forfeitedBy,
+    rematch: buildRematchRecord(game),
     ...extras,
+  };
+}
+
+function buildRematchRecord(game: StoredGame): RematchRecord | null {
+  const rematchGame = game.rematchGame;
+  if (!rematchGame || !game.rematchRequestedBy) {
+    return null;
+  }
+
+  return {
+    joinCode: rematchGame.joinCode,
+    requestedBy: game.rematchRequestedBy,
+    requestedAt: game.rematchRequestedAt,
+    waiting: !rematchGame.blackJoined || !rematchGame.whiteJoined,
+    accepted: rematchGame.blackJoined && rematchGame.whiteJoined,
+  };
+}
+
+function countOccupiedDiscs(board: Board): number {
+  return board.reduce(
+    (total, row) => total + row.filter((cell) => cell !== null).length,
+    0,
+  );
+}
+
+function calculateGameProgress(state: GameState): number {
+  if (state.status === 'finished') {
+    return 100;
+  }
+
+  const movesPlayed = Math.max(0, countOccupiedDiscs(state.board) - 4);
+  return Math.max(0, Math.min(100, Math.round((movesPlayed / 60) * 100)));
+}
+
+function toSavedGameRecord(game: StoredGame, playerColor: Player): SavedGameRecord {
+  return {
+    id: game.id,
+    joinCode: game.joinCode,
+    state: game.state,
+    version: game.version,
+    playerColor,
+    opponentJoined:
+      playerColor === 'white' ? game.blackJoined : game.whiteJoined,
+    playerName: playerColor === 'black' ? game.blackPlayerName : game.whitePlayerName,
+    opponentName: playerColor === 'black' ? game.whitePlayerName : game.blackPlayerName,
+    updatedAt: game.updatedAt,
+    progress:
+      game.endedReason === 'forfeit' || game.endedReason === 'cancelled'
+        ? calculateGameProgress({ ...game.state, status: 'playing' })
+        : calculateGameProgress(game.state),
+    winner: game.winner,
+    endedReason: game.endedReason,
+    forfeitedBy: game.forfeitedBy,
+    rematch: buildRematchRecord(game),
   };
 }
 
@@ -186,6 +341,31 @@ function isGameStatus(value: unknown): value is GameState['status'] {
 
 function isGameResult(value: unknown): value is GameResult {
   return value === 'black' || value === 'white' || value === 'draw';
+}
+
+function isEndedReason(value: unknown): value is EndedReason {
+  return value === 'normal' || value === 'forfeit' || value === 'cancelled';
+}
+
+function normalizeDisplayName(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim().replace(/\s+/g, ' ');
+  if (!trimmed || trimmed.length > MAX_DISPLAY_NAME_LENGTH) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+function parseOptionalDisplayName(value: unknown): string | undefined | null {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  return normalizeDisplayName(value);
 }
 
 function normalizeJoinCode(code: string): string {
@@ -387,7 +567,22 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
       typeof row.rematch_of_game_id !== 'string') ||
     (row.black_invite_token_digest !== null &&
       row.black_invite_token_digest !== undefined &&
-      typeof row.black_invite_token_digest !== 'string')
+      typeof row.black_invite_token_digest !== 'string') ||
+    (row.ended_reason !== null &&
+      row.ended_reason !== undefined &&
+      !isEndedReason(row.ended_reason)) ||
+    (row.forfeited_by !== null &&
+      row.forfeited_by !== undefined &&
+      !isPlayer(row.forfeited_by)) ||
+    (row.rematch_game_id !== null &&
+      row.rematch_game_id !== undefined &&
+      typeof row.rematch_game_id !== 'string') ||
+    (row.rematch_requested_by !== null &&
+      row.rematch_requested_by !== undefined &&
+      !isPlayer(row.rematch_requested_by)) ||
+    (row.rematch_requested_at !== null &&
+      row.rematch_requested_at !== undefined &&
+      typeof row.rematch_requested_at !== 'string')
   ) {
     return null;
   }
@@ -397,7 +592,33 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
     return null;
   }
 
-  const state = resolveTurnState(board, row.current_player, row.consecutive_passes);
+  const endedReason = row.ended_reason ?? 'normal';
+  const forfeitedBy = row.forfeited_by ?? null;
+  const winner = row.winner;
+  if (winner !== null && !isGameResult(winner)) {
+    return null;
+  }
+
+  if (
+    (endedReason === 'forfeit' && !forfeitedBy) ||
+    (endedReason !== 'forfeit' && forfeitedBy) ||
+    (endedReason === 'cancelled' && winner !== null)
+  ) {
+    return null;
+  }
+
+  const resolvedState = resolveTurnState(board, row.current_player, row.consecutive_passes);
+  const state: GameState =
+    endedReason === 'forfeit' || endedReason === 'cancelled'
+      ? {
+          board,
+          currentPlayer: row.current_player,
+          status: 'finished',
+          legalMoves: [],
+          consecutivePasses: row.consecutive_passes,
+        }
+      : resolvedState;
+
   if (state.status !== row.status) {
     return null;
   }
@@ -407,13 +628,14 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
     return null;
   }
 
-  const winner = row.winner;
-  if (winner !== null && !isGameResult(winner)) {
-    return null;
-  }
-
   const expectedWinner =
-    state.status === 'finished' ? getGameResult(scores) : null;
+    state.status === 'finished'
+      ? endedReason === 'forfeit'
+        ? getOpponent(forfeitedBy!)
+        : endedReason === 'cancelled'
+          ? null
+        : getGameResult(scores)
+      : null;
   if (winner !== expectedWinner) {
     return null;
   }
@@ -436,6 +658,13 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
     blackJoined: row.black_joined === undefined ? true : row.black_joined === 1,
     blackInviteTokenDigest: row.black_invite_token_digest ?? '',
     lastMove: parseLastMove(row),
+    blackPlayerName: normalizeDisplayName(row.black_player_name ?? null),
+    whitePlayerName: normalizeDisplayName(row.white_player_name ?? null),
+    endedReason,
+    forfeitedBy,
+    rematchGameId: row.rematch_game_id ?? null,
+    rematchRequestedBy: row.rematch_requested_by ?? null,
+    rematchRequestedAt: row.rematch_requested_at ?? null,
   };
 }
 
@@ -498,7 +727,82 @@ async function parseJoinRequest(request: Request): Promise<JoinRequest | null> {
     return null;
   }
 
-  return { inviteToken: body.inviteToken };
+  const displayName = parseOptionalDisplayName(body.displayName);
+  if (displayName === null) {
+    return null;
+  }
+
+  return { inviteToken: body.inviteToken, displayName };
+}
+
+async function parseCreateGameRequest(request: Request): Promise<CreateGameRequest | null> {
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return {};
+  }
+
+  if (!isPlainObject(body)) {
+    return null;
+  }
+
+  const displayName = parseOptionalDisplayName(body.displayName);
+  return displayName === null ? null : { displayName };
+}
+
+async function parsePlayerProfileRequest(
+  request: Request,
+): Promise<PlayerProfileRequest | null> {
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return null;
+  }
+
+  if (!isPlainObject(body)) {
+    return null;
+  }
+
+  const displayName = normalizeDisplayName(body.displayName);
+  return displayName ? { displayName } : null;
+}
+
+async function parseSavedGamesRequest(
+  request: Request,
+): Promise<SavedGamesRequest | null> {
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return null;
+  }
+
+  if (!isPlainObject(body) || !Array.isArray(body.credentials)) {
+    return null;
+  }
+
+  const credentials = body.credentials
+    .filter(isPlainObject)
+    .map((credential) => ({
+      joinCode:
+        typeof credential.joinCode === 'string'
+          ? normalizeJoinCode(credential.joinCode)
+          : '',
+      playerToken:
+        typeof credential.playerToken === 'string' ? credential.playerToken : '',
+    }))
+    .filter(
+      (credential) =>
+        isValidJoinCode(credential.joinCode) && credential.playerToken.length > 0,
+    )
+    .slice(0, 50);
+
+  return { credentials };
 }
 
 async function parsePushSubscriptionRequest(
@@ -568,7 +872,9 @@ async function getGameByJoinCode(
               rematch_of_game_id, black_joined, black_invite_token_digest,
               black_invite_created_at, black_invite_claimed_at,
               last_move_version, last_move_player, last_move_placed_index,
-              last_move_flipped_indices_json
+              last_move_flipped_indices_json, black_player_name, white_player_name,
+              ended_reason, forfeited_by, rematch_game_id,
+              rematch_requested_by, rematch_requested_at
        FROM games
        WHERE join_code = ?`,
     )
@@ -579,7 +885,39 @@ async function getGameByJoinCode(
     return null;
   }
 
-  return rowToStoredGame(row);
+  const game = rowToStoredGame(row);
+  if (!game?.rematchGameId) {
+    return game;
+  }
+
+  return {
+    ...game,
+    rematchGame: await getGameById(db, game.rematchGameId),
+  };
+}
+
+async function getGameById(db: D1Database, id: string): Promise<StoredGame | null> {
+  const row = await db
+    .prepare(
+      `SELECT id, join_code, board_json, current_player, status, winner,
+              black_score, white_score, consecutive_passes, version,
+              created_at, updated_at, black_player_token_digest,
+              white_player_token_digest, white_invite_token_digest,
+              white_joined, black_player_created_at, white_invite_created_at,
+              white_invite_claimed_at, white_player_created_at,
+              rematch_of_game_id, black_joined, black_invite_token_digest,
+              black_invite_created_at, black_invite_claimed_at,
+              last_move_version, last_move_player, last_move_placed_index,
+              last_move_flipped_indices_json, black_player_name, white_player_name,
+              ended_reason, forfeited_by, rematch_game_id,
+              rematch_requested_by, rematch_requested_at
+       FROM games
+       WHERE id = ?`,
+    )
+    .bind(id)
+    .first<GameRow>();
+
+  return row ? rowToStoredGame(row) : null;
 }
 
 async function authenticateGame(
@@ -621,6 +959,8 @@ async function insertGame(
     readonly blackJoined?: boolean;
     readonly whiteJoined?: boolean;
     readonly rematchOfGameId?: string | null;
+    readonly blackPlayerName?: string | null;
+    readonly whitePlayerName?: string | null;
   },
 ): Promise<boolean> {
   const fields = gameStateToStorageFields(state);
@@ -631,6 +971,8 @@ async function insertGame(
   const blackInviteTokenDigest = options?.blackInviteTokenDigest ?? null;
   const whiteTokenDigest = options?.whiteTokenDigest ?? null;
   const rematchOfGameId = options?.rematchOfGameId ?? null;
+  const blackPlayerName = normalizeDisplayName(options?.blackPlayerName ?? null);
+  const whitePlayerName = normalizeDisplayName(options?.whitePlayerName ?? null);
 
   try {
     await db
@@ -645,8 +987,10 @@ async function insertGame(
           rematch_of_game_id, black_joined, black_invite_token_digest,
           black_invite_created_at, black_invite_claimed_at,
           last_move_version, last_move_player, last_move_placed_index,
-          last_move_flipped_indices_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_move_flipped_indices_json, black_player_name, white_player_name,
+          ended_reason, forfeited_by, rematch_game_id, rematch_requested_by,
+          rematch_requested_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         id,
@@ -678,6 +1022,13 @@ async function insertGame(
         null,
         null,
         null,
+        blackPlayerName,
+        whitePlayerName,
+        null,
+        null,
+        null,
+        null,
+        null,
       )
       .run();
   } catch {
@@ -687,7 +1038,10 @@ async function insertGame(
   return true;
 }
 
-async function createGame(db: D1Database): Promise<GameRecord | null> {
+async function createGame(
+  db: D1Database,
+  displayName?: string,
+): Promise<GameRecord | null> {
   const state = createInitialGameState();
   const blackToken = generateToken();
   const whiteInviteToken = generateToken();
@@ -704,6 +1058,7 @@ async function createGame(db: D1Database): Promise<GameRecord | null> {
       state,
       blackTokenDigest,
       whiteInviteTokenDigest,
+      { blackPlayerName: displayName ?? null },
     );
 
     if (didInsert) {
@@ -724,7 +1079,12 @@ async function createRematchGame(
   db: D1Database,
   previousGame: StoredGame,
   requesterColor: Player,
+  displayName?: string,
 ): Promise<GameRecord | null> {
+  if (previousGame.rematchGame) {
+    return toGameRecord(previousGame.rematchGame, undefined);
+  }
+
   const state = createInitialGameState();
   const requesterNextColor: Player = requesterColor === 'black' ? 'white' : 'black';
   const blackToken = generateToken();
@@ -749,6 +1109,7 @@ async function createRematchGame(
             blackJoined: true,
             whiteJoined: false,
             rematchOfGameId: previousGame.id,
+            blackPlayerName: displayName ?? null,
           }
         : {
             blackJoined: false,
@@ -756,6 +1117,7 @@ async function createRematchGame(
             whiteTokenDigest,
             blackInviteTokenDigest: inviteTokenDigest,
             rematchOfGameId: previousGame.id,
+            whitePlayerName: displayName ?? null,
           },
     );
 
@@ -763,6 +1125,14 @@ async function createRematchGame(
       const game = await getGameByJoinCode(db, joinCode);
       if (!game) {
         return null;
+      }
+
+      const didLink = await linkRematchGame(db, previousGame, game.id, requesterColor);
+      if (!didLink) {
+        const refreshedPreviousGame = await getGameByJoinCode(db, previousGame.joinCode);
+        return refreshedPreviousGame?.rematchGame
+          ? toGameRecord(refreshedPreviousGame.rematchGame, undefined)
+          : null;
       }
 
       return toGameRecord(game, requesterNextColor, {
@@ -775,11 +1145,46 @@ async function createRematchGame(
   return null;
 }
 
+async function linkRematchGame(
+  db: D1Database,
+  previousGame: StoredGame,
+  rematchGameId: string,
+  requesterColor: Player,
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE games
+       SET rematch_game_id = ?,
+           rematch_requested_by = ?,
+           rematch_requested_at = ?,
+           updated_at = ?,
+           version = ?
+       WHERE id = ? AND join_code = ? AND rematch_game_id IS NULL
+         AND status = ? AND version = ?`,
+    )
+    .bind(
+      rematchGameId,
+      requesterColor,
+      now,
+      now,
+      previousGame.version + 1,
+      previousGame.id,
+      previousGame.joinCode,
+      'finished',
+      previousGame.version,
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
 async function claimWhite(
   db: D1Database,
   game: StoredGame,
   inviteTokenDigest: string,
   whiteTokenDigest: string,
+  displayName?: string,
 ): Promise<boolean> {
   const now = new Date().toISOString();
   const result = await db
@@ -791,6 +1196,7 @@ async function claimWhite(
            version = ?,
            white_invite_claimed_at = ?,
            white_player_created_at = ?,
+           white_player_name = ?,
            updated_at = ?
        WHERE id = ? AND join_code = ? AND white_joined = 0
          AND white_invite_token_digest = ?`,
@@ -800,6 +1206,7 @@ async function claimWhite(
       game.version + 1,
       now,
       now,
+      displayName ?? null,
       now,
       game.id,
       game.joinCode,
@@ -815,6 +1222,7 @@ async function claimBlack(
   game: StoredGame,
   inviteTokenDigest: string,
   blackTokenDigest: string,
+  displayName?: string,
 ): Promise<boolean> {
   const now = new Date().toISOString();
   const result = await db
@@ -826,6 +1234,7 @@ async function claimBlack(
            version = ?,
            black_invite_claimed_at = ?,
            black_player_created_at = ?,
+           black_player_name = ?,
            updated_at = ?
        WHERE id = ? AND join_code = ? AND black_joined = 0
          AND black_invite_token_digest = ?`,
@@ -835,6 +1244,7 @@ async function claimBlack(
       game.version + 1,
       now,
       now,
+      displayName ?? null,
       now,
       game.id,
       game.joinCode,
@@ -900,7 +1310,7 @@ export function deriveNotificationEvent({
   readonly previousGame: StoredGame;
   readonly updatedGame: StoredGame;
   readonly actorPlayerColor: Player;
-  readonly eventType: 'join' | 'move';
+  readonly eventType: 'join' | 'move' | 'forfeit';
 }): NotificationEvent | null {
   if (eventType === 'join') {
     if (
@@ -921,7 +1331,20 @@ export function deriveNotificationEvent({
 
   if (updatedGame.state.status === 'finished') {
     const recipientPlayerColor = actorPlayerColor === 'black' ? 'white' : 'black';
-    const winner = getGameResult(getScores(updatedGame.state.board));
+    const winner = updatedGame.winner;
+    if (updatedGame.endedReason === 'forfeit') {
+      const actorName =
+        actorPlayerColor === 'black'
+          ? updatedGame.blackPlayerName
+          : updatedGame.whitePlayerName;
+      return {
+        eventType: 'game_finished',
+        recipientPlayerColor,
+        title: 'Othello game forfeited',
+        body: `${actorName || 'Your opponent'} forfeited. You win the game.`,
+      };
+    }
+
     const body =
       winner === 'draw'
         ? 'The game ended in a draw.'
@@ -1149,7 +1572,7 @@ async function persistMove(
   db: D1Database,
   game: StoredGame,
   nextState: GameState,
-  lastMove: LastMove,
+  lastMove: LastMove | null,
 ): Promise<boolean> {
   const fields = gameStateToStorageFields(nextState);
   const updatedAt = new Date().toISOString();
@@ -1182,10 +1605,10 @@ async function persistMove(
       fields.whiteScore,
       fields.consecutivePasses,
       nextVersion,
-      lastMove.version,
-      lastMove.player,
-      lastMove.placedIndex,
-      JSON.stringify(lastMove.flippedIndices),
+      lastMove?.version ?? null,
+      lastMove?.player ?? null,
+      lastMove?.placedIndex ?? null,
+      lastMove ? JSON.stringify(lastMove.flippedIndices) : null,
       updatedAt,
       game.id,
       game.joinCode,
@@ -1194,6 +1617,40 @@ async function persistMove(
     .run();
 
   return (result.meta.changes ?? 0) > 0;
+}
+
+function simulateGameToEnd(game: StoredGame): {
+  readonly state: GameState;
+  readonly lastMove: LastMove | null;
+} {
+  let state = game.state;
+  let version = game.version;
+  let lastMove: LastMove | null = null;
+
+  while (state.status !== 'finished') {
+    const move = state.legalMoves[0];
+    if (!move) {
+      break;
+    }
+
+    const player = state.currentPlayer;
+    const flips = getAllFlips(state.board, move, player);
+    const nextState = applyMove(state, move);
+    if (!nextState) {
+      break;
+    }
+
+    version += 1;
+    lastMove = {
+      version,
+      player,
+      placedIndex: positionToIndex(move),
+      flippedIndices: flips.map(positionToIndex),
+    };
+    state = nextState;
+  }
+
+  return { state, lastMove };
 }
 
 async function handleJoin(
@@ -1235,8 +1692,20 @@ async function handleJoin(
   const playerTokenDigest = await digestToken(playerToken);
   const didClaim =
     invitedColor === 'white'
-      ? await claimWhite(db, game, inviteDigest, playerTokenDigest)
-      : await claimBlack(db, game, inviteDigest, playerTokenDigest);
+      ? await claimWhite(
+          db,
+          game,
+          inviteDigest,
+          playerTokenDigest,
+          joinRequest.displayName,
+        )
+      : await claimBlack(
+          db,
+          game,
+          inviteDigest,
+          playerTokenDigest,
+          joinRequest.displayName,
+        );
   if (!didClaim) {
     return errorResponse(409, 'Game already joined');
   }
@@ -1329,6 +1798,8 @@ async function handleMove(
 async function handleRematch(
   request: Request,
   db: D1Database,
+  env: WorkerEnv,
+  ctx: ExecutionContext,
   joinCode: string,
 ): Promise<Response> {
   const authResult = await authenticateGame(request, db, joinCode);
@@ -1341,12 +1812,371 @@ async function handleRematch(
     return errorResponse(409, 'Game is not finished');
   }
 
-  const rematch = await createRematchGame(db, game, playerColor);
+  const createGameRequest = await parseCreateGameRequest(request);
+  if (!createGameRequest) {
+    return errorResponse(400, 'Malformed rematch request');
+  }
+  const { displayName } = createGameRequest;
+  const rematch = await createRematchGame(db, game, playerColor, displayName);
   if (!rematch) {
     return errorResponse(500, 'Unable to create rematch');
   }
 
+  const updatedGame = await getGameByJoinCode(db, game.joinCode);
+  if (updatedGame?.rematchGame && !game.rematchGame) {
+    const notification = {
+      eventType: 'rematch_requested' as const,
+      recipientPlayerColor: getOpponent(playerColor),
+      title: 'Othello rematch requested',
+      body: `${
+        playerColor === 'black' ? game.blackPlayerName : game.whitePlayerName
+      || 'Your opponent'} wants to play again.`,
+    };
+    ctx.waitUntil(sendNotificationEvent(db, env, updatedGame, notification));
+  }
+
   return jsonResponse(rematch, { status: 201 });
+}
+
+async function handleAcceptRematch(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<Response> {
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  const { game, playerColor } = authResult;
+  const rematchGame = game.rematchGame;
+  if (!rematchGame || !game.rematchRequestedBy) {
+    return errorResponse(404, 'Rematch not found');
+  }
+  if (game.rematchRequestedBy === playerColor) {
+    return errorResponse(409, 'Waiting for opponent to accept');
+  }
+
+  const nextColor: Player = playerColor === 'black' ? 'white' : 'black';
+  if (rematchGame.blackJoined && rematchGame.whiteJoined) {
+    return jsonResponse(toGameRecord(rematchGame, nextColor));
+  }
+
+  const playerToken = generateToken();
+  const playerTokenDigest = await digestToken(playerToken);
+  const displayName =
+    playerColor === 'black' ? game.blackPlayerName ?? undefined : game.whitePlayerName ?? undefined;
+  const didClaim =
+    nextColor === 'black'
+      ? await claimBlack(
+          db,
+          rematchGame,
+          rematchGame.blackInviteTokenDigest,
+          playerTokenDigest,
+          displayName,
+        )
+      : await claimWhite(
+          db,
+          rematchGame,
+          rematchGame.whiteInviteTokenDigest,
+          playerTokenDigest,
+          displayName,
+        );
+  if (!didClaim) {
+    return errorResponse(409, 'Rematch already accepted');
+  }
+
+  const acceptedGame = await getGameByJoinCode(db, rematchGame.joinCode);
+  if (!acceptedGame) {
+    return errorResponse(404, 'Rematch not found');
+  }
+
+  return jsonResponse(toGameRecord(acceptedGame, nextColor, { playerToken }));
+}
+
+async function handleForfeit(
+  request: Request,
+  db: D1Database,
+  env: WorkerEnv,
+  ctx: ExecutionContext,
+  joinCode: string,
+): Promise<Response> {
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  const { game, playerColor } = authResult;
+  if (!game.blackJoined || !game.whiteJoined) {
+    return errorResponse(409, 'Waiting for opponent to join');
+  }
+  if (game.state.status === 'finished') {
+    return errorResponse(409, 'Game is already finished');
+  }
+
+  const didPersist = await persistForfeit(db, game, playerColor);
+  if (!didPersist) {
+    return errorResponse(409, 'Game is already finished');
+  }
+
+  const persistedGame = await getGameByJoinCode(db, game.joinCode);
+  if (!persistedGame) {
+    return errorResponse(404, 'Game not found');
+  }
+
+  const notification = deriveNotificationEvent({
+    previousGame: game,
+    updatedGame: persistedGame,
+    actorPlayerColor: playerColor,
+    eventType: 'forfeit',
+  });
+  if (notification) {
+    ctx.waitUntil(sendNotificationEvent(db, env, persistedGame, notification));
+  }
+
+  return jsonResponse(toGameRecord(persistedGame, playerColor));
+}
+
+async function handleCancelGame(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<Response> {
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  const { game, playerColor } = authResult;
+  if (playerColor !== 'black') {
+    return errorResponse(403, 'Only the creator can cancel this game');
+  }
+  if (game.state.status === 'finished') {
+    return errorResponse(409, 'Game is already finished');
+  }
+  if (game.whiteJoined) {
+    return errorResponse(409, 'Game already joined');
+  }
+
+  const didPersist = await persistCancellation(db, game);
+  if (!didPersist) {
+    return errorResponse(409, 'Game can no longer be cancelled');
+  }
+
+  const persistedGame = await getGameByJoinCode(db, game.joinCode);
+  if (!persistedGame) {
+    return errorResponse(404, 'Game not found');
+  }
+
+  return jsonResponse(toGameRecord(persistedGame, playerColor));
+}
+
+async function handleSavedGames(request: Request, db: D1Database): Promise<Response> {
+  const savedGamesRequest = await parseSavedGamesRequest(request);
+  if (!savedGamesRequest) {
+    return errorResponse(400, 'Malformed saved games request');
+  }
+
+  const games: SavedGameRecord[] = [];
+  const seenCodes = new Set<string>();
+
+  for (const credential of savedGamesRequest.credentials) {
+    if (seenCodes.has(credential.joinCode)) {
+      continue;
+    }
+    seenCodes.add(credential.joinCode);
+
+    const game = await getGameByJoinCode(db, credential.joinCode);
+    if (!game) {
+      continue;
+    }
+
+    const tokenDigest = await digestToken(credential.playerToken);
+    const playerColor =
+      tokenDigest === game.blackPlayerTokenDigest
+        ? 'black'
+        : game.whitePlayerTokenDigest && tokenDigest === game.whitePlayerTokenDigest
+          ? 'white'
+          : null;
+
+    if (playerColor) {
+      games.push(toSavedGameRecord(game, playerColor));
+    }
+  }
+
+  games.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return jsonResponse({ games });
+}
+
+async function updatePlayerName(
+  db: D1Database,
+  game: StoredGame,
+  playerColor: Player,
+  displayName: string,
+): Promise<boolean> {
+  const column = playerColor === 'black' ? 'black_player_name' : 'white_player_name';
+  const result = await db
+    .prepare(
+      `UPDATE games
+       SET ${column} = ?, updated_at = ?
+       WHERE id = ? AND join_code = ?`,
+    )
+    .bind(displayName, new Date().toISOString(), game.id, game.joinCode)
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+async function persistForfeit(
+  db: D1Database,
+  game: StoredGame,
+  forfeitingPlayer: Player,
+): Promise<boolean> {
+  const updatedAt = new Date().toISOString();
+  const winner = getOpponent(forfeitingPlayer);
+  const nextVersion = game.version + 1;
+  const result = await db
+    .prepare(
+      `UPDATE games
+       SET status = ?,
+           winner = ?,
+           version = ?,
+           ended_reason = ?,
+           forfeited_by = ?,
+           last_move_version = NULL,
+           last_move_player = NULL,
+           last_move_placed_index = NULL,
+           last_move_flipped_indices_json = NULL,
+           updated_at = ?
+       WHERE id = ? AND join_code = ? AND status = ? AND version = ?`,
+    )
+    .bind(
+      'finished',
+      winner,
+      nextVersion,
+      'forfeit',
+      forfeitingPlayer,
+      updatedAt,
+      game.id,
+      game.joinCode,
+      'playing',
+      game.version,
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+async function persistCancellation(
+  db: D1Database,
+  game: StoredGame,
+): Promise<boolean> {
+  const updatedAt = new Date().toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE games
+       SET status = ?,
+           winner = NULL,
+           version = ?,
+           ended_reason = ?,
+           forfeited_by = NULL,
+           white_invite_token_digest = NULL,
+           black_invite_token_digest = NULL,
+           last_move_version = NULL,
+           last_move_player = NULL,
+           last_move_placed_index = NULL,
+           last_move_flipped_indices_json = NULL,
+           updated_at = ?
+       WHERE id = ? AND join_code = ? AND status = ? AND version = ?
+         AND black_joined = 1 AND white_joined = 0`,
+    )
+    .bind(
+      'finished',
+      game.version + 1,
+      'cancelled',
+      updatedAt,
+      game.id,
+      game.joinCode,
+      'playing',
+      game.version,
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+async function handlePlayerProfile(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<Response> {
+  const profileRequest = await parsePlayerProfileRequest(request);
+  if (!profileRequest) {
+    return errorResponse(400, 'Malformed player profile');
+  }
+
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  const didUpdate = await updatePlayerName(
+    db,
+    authResult.game,
+    authResult.playerColor,
+    profileRequest.displayName,
+  );
+  if (!didUpdate) {
+    return errorResponse(404, 'Game not found');
+  }
+
+  const updatedGame = await getGameByJoinCode(db, authResult.game.joinCode);
+  if (!updatedGame) {
+    return errorResponse(404, 'Game not found');
+  }
+
+  return jsonResponse(toGameRecord(updatedGame, authResult.playerColor));
+}
+
+async function handleSkipToEnd(
+  request: Request,
+  db: D1Database,
+  env: WorkerEnv,
+  joinCode: string,
+): Promise<Response> {
+  if (!isTestControlsEnabled(env)) {
+    return errorResponse(404, 'Not found');
+  }
+
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  const { game, playerColor } = authResult;
+  if (game.state.status === 'finished') {
+    return errorResponse(409, 'Game is already finished');
+  }
+
+  const simulated = simulateGameToEnd(game);
+  if (simulated.state.status !== 'finished') {
+    return errorResponse(500, 'Unable to finish game');
+  }
+
+  const lastMove = simulated.lastMove
+    ? { ...simulated.lastMove, version: game.version + 1 }
+    : null;
+  const didPersist = await persistMove(db, game, simulated.state, lastMove);
+  if (!didPersist) {
+    return errorResponse(409, 'Stale game version');
+  }
+
+  const persistedGame = await getGameByJoinCode(db, game.joinCode);
+  if (!persistedGame) {
+    return errorResponse(404, 'Game not found');
+  }
+
+  return jsonResponse(toGameRecord(persistedGame, playerColor));
 }
 
 async function handleSubscribe(
@@ -1400,9 +2230,21 @@ async function handleUnsubscribe(
 }
 
 function parseGamePath(pathname: string):
-  | { readonly code: string; readonly action: 'read' | 'move' | 'join' | 'push' | 'rematch' }
+  | {
+      readonly code: string;
+      readonly action:
+        | 'read'
+        | 'move'
+        | 'join'
+        | 'push'
+        | 'rematch'
+        | 'forfeit'
+        | 'cancel'
+        | 'skip-to-end'
+        | 'player-profile';
+    }
   | null {
-  const match = /^\/api\/games\/([^/]+)(?:\/(moves|join|push-subscriptions|rematch))?$/.exec(pathname);
+  const match = /^\/api\/games\/([^/]+)(?:\/(moves|join|push-subscriptions|rematch|forfeit|cancel|test\/skip-to-end|player-profile))?$/.exec(pathname);
   if (!match) {
     return null;
   }
@@ -1419,7 +2261,15 @@ function parseGamePath(pathname: string):
             ? 'push'
             : suffix === 'rematch'
               ? 'rematch'
-              : 'read',
+              : suffix === 'forfeit'
+                ? 'forfeit'
+                : suffix === 'cancel'
+                  ? 'cancel'
+                  : suffix === 'test/skip-to-end'
+                    ? 'skip-to-end'
+                    : suffix === 'player-profile'
+                      ? 'player-profile'
+                      : 'read',
   };
 }
 
@@ -1436,13 +2286,33 @@ async function routeApiRequest(
     });
   }
 
+  if (url.pathname === '/api/test-controls' && request.method === 'GET') {
+    return jsonResponse({ enabled: isTestControlsEnabled(env) });
+  }
+
+  if (url.pathname === '/api/games/saved' && request.method === 'POST') {
+    return handleSavedGames(request, env.DB);
+  }
+
   if (url.pathname === '/api/games' && request.method === 'POST') {
-    const game = await createGame(env.DB);
+    const createGameRequest = await parseCreateGameRequest(request);
+    if (!createGameRequest) {
+      return errorResponse(400, 'Malformed game request');
+    }
+    const { displayName } = createGameRequest;
+    const game = await createGame(env.DB, displayName);
     if (!game) {
       return errorResponse(500, 'Unable to create game');
     }
 
     return jsonResponse(game, { status: 201 });
+  }
+
+  const rematchAcceptMatch = /^\/api\/games\/([^/]+)\/rematch\/accept$/.exec(
+    url.pathname,
+  );
+  if (rematchAcceptMatch && request.method === 'POST') {
+    return handleAcceptRematch(request, env.DB, decodeURIComponent(rematchAcceptMatch[1]));
   }
 
   const gamePath = parseGamePath(url.pathname);
@@ -1476,7 +2346,23 @@ async function routeApiRequest(
   }
 
   if (gamePath?.action === 'rematch' && request.method === 'POST') {
-    return handleRematch(request, env.DB, gamePath.code);
+    return handleRematch(request, env.DB, env, ctx, gamePath.code);
+  }
+
+  if (gamePath?.action === 'forfeit' && request.method === 'POST') {
+    return handleForfeit(request, env.DB, env, ctx, gamePath.code);
+  }
+
+  if (gamePath?.action === 'cancel' && request.method === 'POST') {
+    return handleCancelGame(request, env.DB, gamePath.code);
+  }
+
+  if (gamePath?.action === 'player-profile' && request.method === 'PATCH') {
+    return handlePlayerProfile(request, env.DB, gamePath.code);
+  }
+
+  if (gamePath?.action === 'skip-to-end' && request.method === 'POST') {
+    return handleSkipToEnd(request, env.DB, env, gamePath.code);
   }
 
   return errorResponse(404, 'Not found');

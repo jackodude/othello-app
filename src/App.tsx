@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import type { FormEvent } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import type { FormEvent, KeyboardEvent } from 'react';
 
 import { Board } from './components/Board';
 import { GameStatus } from './components/GameStatus';
@@ -27,10 +27,29 @@ import {
 } from './hooks/pushNotifications';
 import { getRelativeStatusMessage } from './hooks/gamePresentation';
 import {
+  filterSavedGameCards,
+  deriveRematchInboxItems,
+  deriveMatchStats,
+  getLibraryStatusLabel,
+  isCompletedGame,
+  readGameLibraryFilter,
+  writeGameLibraryFilter,
+  type GameLibraryFilter,
+} from './hooks/gameLibrary';
+import {
+  shouldShowCancelAction,
   shouldShowInvitationPanel,
+  shouldShowForfeitAction,
   shouldShowLegalMoves,
   shouldShowRematchButton,
+  shouldShowSkipToEndButton,
 } from './hooks/gameUiState';
+import {
+  loadPlayerProfile,
+  normalizeDisplayName,
+  savePlayerProfile,
+} from './hooks/playerProfile';
+import { INVITATION_COPY_LABEL } from './hooks/invitationUi';
 import { useGame } from './hooks/useGame';
 import './App.css';
 
@@ -46,6 +65,17 @@ function App() {
 
     return loadGamePreferences(window.localStorage);
   });
+  const [playerProfile, setPlayerProfile] = useState(() => {
+    if (typeof window === 'undefined') {
+      return { displayName: null };
+    }
+
+    return loadPlayerProfile(window.localStorage);
+  });
+  const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+  const [profileNameInput, setProfileNameInput] = useState('');
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const profileButtonRef = useRef<HTMLButtonElement | null>(null);
   const [prefersReducedMotion, setPrefersReducedMotion] = useState(() => {
     if (typeof window === 'undefined' || !window.matchMedia) {
       return false;
@@ -58,6 +88,7 @@ function App() {
     joinCode,
     invitation,
     playerColor,
+    opponentName,
     playerToken,
     opponentJoined,
     isAuthenticated,
@@ -67,26 +98,58 @@ function App() {
     playMove,
     startNewGame,
     createRematch,
+    acceptRematch,
+    acceptRematchFromParent,
+    forfeitCurrentGame,
+    cancelCurrentGame,
+    skipToEnd,
     claimWhiteFromInvitation,
     switchGame,
+    loadGame,
+    removeSavedGameFromHistory,
+    syncDisplayNameToSavedGames,
     hasSelectedGame,
     showGameSelection,
     isLoading,
     isSubmittingMove,
     isCreatingRematch,
+    acceptingRematchParentCode,
+    isForfeiting,
+    isSkippingToEnd,
+    areTestControlsEnabled,
+    savedGames,
+    isLoadingSavedGames,
     errorMessage,
     errorKind,
     syncWarningMessage,
     recentPositions,
     animationPhase,
     lastMove,
+    endedReason,
+    forfeitedBy,
+    rematch,
     isAnimatingMove,
   } = useGame({
     animateMoves: preferences.animateDiscChanges && !prefersReducedMotion,
+    displayName: playerProfile.displayName,
   });
   const [invitationInput, setInvitationInput] = useState('');
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [forfeitTarget, setForfeitTarget] = useState<{
+    readonly joinCode: string;
+    readonly opponentName: string | null;
+    readonly kind: 'forfeit' | 'cancel';
+  } | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<{
+    readonly joinCode: string;
+    readonly opponentName: string | null;
+  } | null>(null);
+  const [libraryFilter, setLibraryFilter] = useState<GameLibraryFilter>(() =>
+    typeof window === 'undefined'
+      ? 'in-progress'
+      : readGameLibraryFilter(window.localStorage),
+  );
   const [installPrompt, setInstallPrompt] =
     useState<BeforeInstallPromptEvent | null>(null);
   const [isInstallHelpDismissed, setIsInstallHelpDismissed] = useState(() => {
@@ -164,12 +227,45 @@ function App() {
     void claimWhiteFromInvitation(invitationInput);
   }
 
+  function openProfileModal() {
+    setProfileNameInput(playerProfile.displayName ?? '');
+    setProfileError(null);
+    setIsProfileModalOpen(true);
+  }
+
+  function closeProfileModal() {
+    setIsProfileModalOpen(false);
+    setProfileError(null);
+    window.setTimeout(() => profileButtonRef.current?.focus(), 0);
+  }
+
+  function handleProfileModalKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      closeProfileModal();
+    }
+  }
+
+  async function handleProfileSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const displayName = normalizeDisplayName(profileNameInput);
+    if (!displayName) {
+      setProfileError('Enter a display name of 24 characters or fewer.');
+      return;
+    }
+
+    const nextProfile = { displayName };
+    setPlayerProfile(nextProfile);
+    savePlayerProfile(window.localStorage, nextProfile);
+    closeProfileModal();
+    await syncDisplayNameToSavedGames(displayName);
+  }
+
   const showLegalMoves = shouldShowLegalMoves({
     isAuthenticated,
     opponentJoined,
     gameStatus: gameState.status,
     isYourTurn,
-    isSubmittingMove,
+    isSubmittingMove: isSubmittingMove || isSkippingToEnd,
     isLoading,
   });
   const boardDisabled = !showLegalMoves || isAnimatingMove;
@@ -201,6 +297,9 @@ function App() {
     playerColor,
     opponentJoined,
     isYourTurn,
+    opponentName,
+    endedReason,
+    forfeitedBy,
   });
 
   async function handleCopyInvitation() {
@@ -367,6 +466,92 @@ function App() {
     }
   }
 
+  function handleSkipToEnd() {
+    if (!window.confirm('Finish this game immediately for testing?')) {
+      return;
+    }
+
+    void skipToEnd();
+  }
+
+  function handleSavedGameSelect(savedJoinCode: string) {
+    void loadGame(savedJoinCode);
+  }
+
+  function openForfeitConfirmation(target: {
+    readonly joinCode: string;
+    readonly opponentName: string | null;
+    readonly kind: 'forfeit' | 'cancel';
+  }) {
+    setForfeitTarget(target);
+  }
+
+  function closeForfeitConfirmation() {
+    if (!isForfeiting) {
+      setForfeitTarget(null);
+    }
+  }
+
+  async function confirmForfeit() {
+    if (!forfeitTarget || isForfeiting) {
+      return;
+    }
+
+    if (forfeitTarget.kind === 'cancel') {
+      await cancelCurrentGame(forfeitTarget.joinCode);
+    } else {
+      await forfeitCurrentGame(forfeitTarget.joinCode);
+    }
+    setForfeitTarget(null);
+  }
+
+  function handleForfeitModalKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      closeForfeitConfirmation();
+    }
+  }
+
+  function closeRemoveConfirmation() {
+    setRemoveTarget(null);
+  }
+
+  function confirmRemoveFromHistory() {
+    if (!removeTarget) {
+      return;
+    }
+
+    removeSavedGameFromHistory(removeTarget.joinCode);
+    setRemoveTarget(null);
+  }
+
+  function handleRemoveModalKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      closeRemoveConfirmation();
+    }
+  }
+
+  const canForfeitActiveGame = shouldShowForfeitAction({
+    isAuthenticated,
+    opponentJoined,
+    gameStatus: gameState.status,
+    isTerminalActionInFlight: isCreatingRematch || isSkippingToEnd || isForfeiting,
+  });
+  const canCancelActiveGame = shouldShowCancelAction({
+    isAuthenticated,
+    playerColor,
+    opponentJoined,
+    gameStatus: gameState.status,
+    isTerminalActionInFlight: isCreatingRematch || isSkippingToEnd || isForfeiting,
+  });
+  const filteredSavedGames = filterSavedGameCards(savedGames, libraryFilter);
+  const rematchInboxItems = deriveRematchInboxItems(savedGames);
+  const matchStats = deriveMatchStats(savedGames);
+
+  function updateLibraryFilter(nextFilter: GameLibraryFilter) {
+    setLibraryFilter(nextFilter);
+    writeGameLibraryFilter(window.localStorage, nextFilter);
+  }
+
   return (
     <main className="app">
       <header className="header">
@@ -386,8 +571,13 @@ function App() {
           <span aria-hidden="true">&#9881;</span>
         </button>
         {hasSelectedGame && !showGameSelection && (
-          <button type="button" className="load-game-button" onClick={switchGame}>
-            Switch game
+          <button
+            type="button"
+            className="load-game-button"
+            aria-label="Home"
+            onClick={switchGame}
+          >
+            Home
           </button>
         )}
       </div>
@@ -427,6 +617,21 @@ function App() {
               <span>Show legal move indicators</span>
             </label>
           </fieldset>
+
+          <div className="profile-settings">
+            <div>
+              <strong>Player Profile</strong>
+              <p>{playerProfile.displayName ?? 'Not set'}</p>
+            </div>
+            <button
+              ref={profileButtonRef}
+              type="button"
+              className="load-game-button"
+              onClick={openProfileModal}
+            >
+              Edit profile
+            </button>
+          </div>
 
           {isAuthenticated && hasSelectedGame && (
             <div className="notification-panel" aria-label="Push notifications">
@@ -471,6 +676,147 @@ function App() {
         </section>
       )}
 
+      {isProfileModalOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onKeyDown={handleProfileModalKeyDown}
+        >
+          <div
+            className="profile-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="profile-modal-title"
+          >
+            <form className="profile-form" onSubmit={(event) => void handleProfileSubmit(event)}>
+              <h2 id="profile-modal-title">Edit profile</h2>
+              <label className="join-form__label" htmlFor="display-name">
+                Display name
+              </label>
+              <input
+                id="display-name"
+                className="token-input"
+                value={profileNameInput}
+                maxLength={24}
+                autoFocus
+                onChange={(event) => setProfileNameInput(event.target.value)}
+              />
+              {profileError && (
+                <p className="profile-form__error" role="alert">
+                  {profileError}
+                </p>
+              )}
+              <div className="profile-form__actions">
+                <button type="button" className="load-game-button" onClick={closeProfileModal}>
+                  Cancel
+                </button>
+                <button type="submit" className="new-game-button">
+                  Save
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {forfeitTarget && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onKeyDown={handleForfeitModalKeyDown}
+        >
+          <div
+            className="profile-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="forfeit-modal-title"
+          >
+            <div className="profile-form">
+              <h2 id="forfeit-modal-title">
+                {forfeitTarget.kind === 'cancel'
+                  ? 'Cancel this game?'
+                  : 'Forfeit this game?'}
+              </h2>
+              {forfeitTarget.kind === 'cancel' ? (
+                <p className="modal-copy">
+                  This invitation will stop working and the game will be moved to
+                  your completed games. This cannot be undone.
+                </p>
+              ) : (
+                <p className="modal-copy">
+                  You will lose this game and{' '}
+                  {forfeitTarget.opponentName || 'your opponent'} will be declared
+                  the winner. This cannot be undone.
+                </p>
+              )}
+              <div className="profile-form__actions">
+                <button
+                  type="button"
+                  className="load-game-button"
+                  disabled={isForfeiting}
+                  onClick={closeForfeitConfirmation}
+                >
+                  {forfeitTarget.kind === 'cancel' ? 'Keep game' : 'Keep playing'}
+                </button>
+                <button
+                  type="button"
+                  className="danger-button"
+                  disabled={isForfeiting}
+                  onClick={() => void confirmForfeit()}
+                >
+                  {isForfeiting
+                    ? forfeitTarget.kind === 'cancel'
+                      ? 'Cancelling...'
+                      : 'Forfeiting...'
+                    : forfeitTarget.kind === 'cancel'
+                      ? 'Cancel game'
+                      : 'Forfeit game'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {removeTarget && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onKeyDown={handleRemoveModalKeyDown}
+        >
+          <div
+            className="profile-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="remove-modal-title"
+          >
+            <div className="profile-form">
+              <h2 id="remove-modal-title">Remove this game?</h2>
+              <p className="modal-copy">
+                This removes the game from your history on this device. It will not
+                remove it for the other player.
+              </p>
+              <div className="profile-form__actions">
+                <button
+                  type="button"
+                  className="load-game-button"
+                  onClick={closeRemoveConfirmation}
+                >
+                  Keep game
+                </button>
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={confirmRemoveFromHistory}
+                >
+                  Remove game
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {(canUseNativeInstallPrompt || showIosGuidance) && (
         <section className="install-panel" aria-label="Install Othello">
           <div>
@@ -506,6 +852,27 @@ function App() {
 
       {showGameSelection && (
         <>
+          <section className="join-panel" aria-label="Join game">
+            <form className="join-form" onSubmit={handleJoinSubmit}>
+              <label className="join-form__label" htmlFor="invitation">
+                Paste invitation
+              </label>
+              <div className="join-form__row">
+                <input
+                  id="invitation"
+                  className="token-input"
+                  value={invitationInput}
+                  onChange={(event) => setInvitationInput(event.target.value)}
+                  placeholder="Enter invite code"
+                  disabled={isLoading}
+                />
+                <button type="submit" className="load-game-button" disabled={isLoading}>
+                  Join
+                </button>
+              </div>
+            </form>
+          </section>
+
           <section className="game-controls" aria-label="Game selection">
             <button
               type="button"
@@ -517,32 +884,243 @@ function App() {
             </button>
           </section>
 
-          <section className="join-panel" aria-label="Join as White">
-            <form className="join-form" onSubmit={handleJoinSubmit}>
-              <label className="join-form__label" htmlFor="invitation">
-                Paste invitation
-              </label>
-              <div className="join-form__row">
-                <input
-                  id="invitation"
-                  className="token-input"
-                  value={invitationInput}
-                  onChange={(event) => setInvitationInput(event.target.value)}
-                  placeholder="CODE:INVITE_TOKEN"
-                  disabled={isLoading}
-                />
-                <button type="submit" className="load-game-button" disabled={isLoading}>
-                  Join as White
-                </button>
+          <section className="match-stats" aria-label="Match stats">
+            <h2>Match stats</h2>
+            {matchStats.lastCompletedMatch ? (
+              <>
+                <div className="match-stats__section">
+                  <h3>Last completed match</h3>
+                  <dl className="match-stats__details">
+                    <div>
+                      <dt>Opponent</dt>
+                      <dd>{matchStats.lastCompletedMatch.opponentName}</dd>
+                    </div>
+                    <div>
+                      <dt>Result</dt>
+                      <dd>
+                        {matchStats.lastCompletedMatch.result === 'win'
+                          ? 'You won'
+                          : matchStats.lastCompletedMatch.result === 'loss'
+                            ? 'You lost'
+                            : 'Draw'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Final score</dt>
+                      <dd>{matchStats.lastCompletedMatch.finalScore}</dd>
+                    </div>
+                    <div>
+                      <dt>Finished</dt>
+                      <dd>{matchStats.lastCompletedMatch.finishedDate}</dd>
+                    </div>
+                  </dl>
+                </div>
+                <div className="match-stats__section">
+                  <h3>Overall record</h3>
+                  <dl className="match-stats__record">
+                    <div>
+                      <dt>Games played</dt>
+                      <dd>{matchStats.gamesPlayed}</dd>
+                    </div>
+                    <div>
+                      <dt>Wins</dt>
+                      <dd>{matchStats.wins}</dd>
+                    </div>
+                    <div>
+                      <dt>Losses</dt>
+                      <dd>{matchStats.losses}</dd>
+                    </div>
+                    <div>
+                      <dt>Win percentage</dt>
+                      <dd>{matchStats.winPercentage}%</dd>
+                    </div>
+                  </dl>
+                </div>
+              </>
+            ) : (
+              <div className="match-stats__empty">
+                <p>No completed games yet.</p>
+                <p>Finish your first game to start building your record.</p>
               </div>
-            </form>
+            )}
+          </section>
+
+          {rematchInboxItems.length > 0 && (
+            <section className="rematch-inbox" aria-label="Pending rematches">
+              <div className="rematch-inbox__header">
+                <h2>Rematches</h2>
+              </div>
+              <div className="rematch-inbox__list">
+                {rematchInboxItems.map((item) => (
+                  <article
+                    key={`${item.parentCode}:${item.childCode}`}
+                    className="rematch-card"
+                  >
+                    <div>
+                      <h3>
+                        {item.requiresAcceptance
+                          ? `${item.opponentName} wants to play again`
+                          : `Waiting for ${item.opponentName} to accept`}
+                      </h3>
+                      <p>
+                        {item.requiresAcceptance
+                          ? 'Accept to enter the new game.'
+                          : 'The rematch is ready when they accept.'}
+                      </p>
+                    </div>
+                    {item.requiresAcceptance && (
+                      <button
+                        type="button"
+                        className="new-game-button rematch-card__accept"
+                        disabled={acceptingRematchParentCode === item.parentCode}
+                        onClick={() => void acceptRematchFromParent(item.parentCode)}
+                      >
+                        {acceptingRematchParentCode === item.parentCode
+                          ? 'Accepting...'
+                          : 'Accept'}
+                      </button>
+                    )}
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
+
+          <section className="game-library" aria-label="Saved games">
+            <div className="game-library__header">
+              <h2>Your games</h2>
+              {isLoadingSavedGames && <span>Refreshing...</span>}
+            </div>
+            <div className="library-filter" role="tablist" aria-label="Game filter">
+              {[
+                ['in-progress', 'In progress'],
+                ['completed', 'Completed'],
+                ['all', 'All'],
+              ].map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="tab"
+                  aria-selected={libraryFilter === value}
+                  className={libraryFilter === value ? 'library-filter__tab--active' : ''}
+                  onClick={() => updateLibraryFilter(value as GameLibraryFilter)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {filteredSavedGames.length > 0 ? (
+              <div className="game-library__list">
+                {filteredSavedGames.map((savedGame) => (
+                  <div
+                    key={savedGame.joinCode}
+                    className={[
+                      'game-card',
+                      savedGame.joinCode === joinCode ? 'game-card--selected' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
+                  >
+                    <button
+                      type="button"
+                      className="game-card__select"
+                      onClick={() => handleSavedGameSelect(savedGame.joinCode)}
+                    >
+                      <span className="game-card__opponent">
+                        {savedGame.opponentName || 'Opponent'}
+                      </span>
+                      <span className="game-card__status">
+                        {getLibraryStatusLabel(savedGame)}
+                      </span>
+                      <span className="game-card__meta">
+                        You are {savedGame.playerColor === 'black' ? 'Black' : 'White'}
+                        {' - '}
+                        {savedGame.progress}%
+                      </span>
+                    </button>
+                    {shouldShowCancelAction({
+                      isAuthenticated: true,
+                      playerColor: savedGame.playerColor,
+                      opponentJoined: savedGame.opponentJoined,
+                      gameStatus: savedGame.state.status,
+                      isTerminalActionInFlight: isForfeiting,
+                    }) && (
+                      <button
+                        type="button"
+                        className="game-card__action"
+                        aria-label="Cancel game invitation"
+                        title="Cancel game"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          openForfeitConfirmation({
+                            joinCode: savedGame.joinCode,
+                            opponentName: savedGame.opponentName,
+                            kind: 'cancel',
+                          });
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    )}
+                    {shouldShowForfeitAction({
+                      isAuthenticated: true,
+                      opponentJoined: savedGame.opponentJoined,
+                      gameStatus: savedGame.state.status,
+                      isTerminalActionInFlight: isForfeiting,
+                    }) && (
+                      <button
+                        type="button"
+                        className="game-card__action"
+                        aria-label={`Forfeit game against ${savedGame.opponentName || 'Opponent'}`}
+                        title="Forfeit game"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          openForfeitConfirmation({
+                            joinCode: savedGame.joinCode,
+                            opponentName: savedGame.opponentName,
+                            kind: 'forfeit',
+                          });
+                        }}
+                      >
+                        Forfeit
+                      </button>
+                    )}
+                    {isCompletedGame(savedGame) && (
+                      <button
+                        type="button"
+                        className="game-card__remove"
+                        aria-label={`Remove game against ${savedGame.opponentName || 'Opponent'} from history`}
+                        title="Remove from history"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setRemoveTarget({
+                            joinCode: savedGame.joinCode,
+                            opponentName: savedGame.opponentName,
+                          });
+                        }}
+                      >
+                        <span aria-hidden="true">🗑</span>
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="game-library__empty">
+                {libraryFilter === 'completed'
+                  ? 'No completed games yet.'
+                  : libraryFilter === 'all'
+                    ? 'No saved games on this device.'
+                    : 'No games in progress.'}
+              </p>
+            )}
           </section>
         </>
       )}
 
-      {(isLoading || !hasSelectedGame) && (
+      {isLoading && (
         <div className="connection-status" aria-live="polite">
-          {isLoading ? 'Loading game...' : 'No game selected'}
+          Loading game...
         </div>
       )}
 
@@ -556,11 +1134,11 @@ function App() {
             <span>{invitation}</span>
             <button
               type="button"
-              className="load-game-button"
-              aria-label="Copy White invitation"
+              className="new-game-button invitation-box__copy"
+              aria-label={INVITATION_COPY_LABEL}
               onClick={() => void handleCopyInvitation()}
             >
-              Copy
+              {INVITATION_COPY_LABEL}
             </button>
           </div>
           {copyFeedback && (
@@ -603,16 +1181,91 @@ function App() {
             consecutivePasses={gameState.consecutivePasses}
             statusMessage={statusMessage}
             isSubmittingMove={isSubmittingMove}
+            opponentName={opponentName}
           />
 
           {shouldShowRematchButton(isAuthenticated, gameState.status) && (
+            <div className="rematch-action">
+              {rematch?.waiting && rematch.requestedBy !== playerColor ? (
+                <button
+                  type="button"
+                  className="new-game-button"
+                  disabled={isCreatingRematch || acceptingRematchParentCode === joinCode}
+                  onClick={() => {
+                    if (joinCode) {
+                      void acceptRematchFromParent(joinCode);
+                    } else {
+                      void acceptRematch();
+                    }
+                  }}
+                >
+                  {isCreatingRematch || acceptingRematchParentCode === joinCode
+                    ? 'Joining rematch...'
+                    : 'Accept rematch'}
+                </button>
+              ) : rematch?.waiting && rematch.requestedBy === playerColor ? (
+                <div className="connection-status" role="status">
+                  Waiting for {opponentName || 'opponent'}
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="new-game-button"
+                  disabled={isCreatingRematch || endedReason === 'cancelled'}
+                  onClick={() => void createRematch()}
+                >
+                  {isCreatingRematch ? 'Creating rematch...' : 'Play Again'}
+                </button>
+              )}
+            </div>
+          )}
+
+          {canCancelActiveGame && joinCode && (
             <button
               type="button"
-              className="new-game-button"
-              disabled={isCreatingRematch}
-              onClick={() => void createRematch()}
+              className="danger-button danger-button--secondary"
+              disabled={isForfeiting}
+              onClick={() =>
+                openForfeitConfirmation({
+                  joinCode,
+                  opponentName,
+                  kind: 'cancel',
+                })
+              }
             >
-              {isCreatingRematch ? 'Creating rematch...' : 'Play Again'}
+              Cancel game
+            </button>
+          )}
+
+          {canForfeitActiveGame && joinCode && (
+            <button
+              type="button"
+              className="danger-button danger-button--secondary"
+              disabled={isForfeiting}
+              onClick={() =>
+                openForfeitConfirmation({
+                  joinCode,
+                  opponentName,
+                  kind: 'forfeit',
+                })
+              }
+            >
+              Forfeit game
+            </button>
+          )}
+
+          {shouldShowSkipToEndButton({
+            testControlsEnabled: areTestControlsEnabled,
+            isAuthenticated,
+            gameStatus: gameState.status,
+          }) && (
+            <button
+              type="button"
+              className="test-control-button"
+              disabled={isSkippingToEnd}
+              onClick={handleSkipToEnd}
+            >
+              {isSkippingToEnd ? 'Finishing game...' : 'Skip to end'}
             </button>
           )}
 
@@ -630,12 +1283,7 @@ function App() {
             lastMove={lastMove}
           />
         </>
-      ) : (
-        <section className="empty-state" aria-live="polite">
-          <h2>No game selected</h2>
-          <p>Start a new game or paste an invitation.</p>
-        </section>
-      )}
+      ) : null}
     </main>
   );
 }

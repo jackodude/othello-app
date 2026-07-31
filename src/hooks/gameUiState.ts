@@ -54,3 +54,56 @@ export function shouldShowRematchButton(
 ): boolean {
   return isAuthenticated && gameStatus === 'finished';
 }
+
+export function shouldShowSkipToEndButton({
+  testControlsEnabled,
+  isAuthenticated,
+  gameStatus,
+}: {
+  readonly testControlsEnabled: boolean;
+  readonly isAuthenticated: boolean;
+  readonly gameStatus: GameStatus;
+}): boolean {
+  return testControlsEnabled && isAuthenticated && gameStatus === 'playing';
+}
+
+export function shouldShowForfeitAction({
+  isAuthenticated,
+  opponentJoined,
+  gameStatus,
+  isTerminalActionInFlight,
+}: {
+  readonly isAuthenticated: boolean;
+  readonly opponentJoined: boolean;
+  readonly gameStatus: GameStatus;
+  readonly isTerminalActionInFlight: boolean;
+}): boolean {
+  return (
+    isAuthenticated &&
+    opponentJoined &&
+    gameStatus === 'playing' &&
+    !isTerminalActionInFlight
+  );
+}
+
+export function shouldShowCancelAction({
+  isAuthenticated,
+  playerColor,
+  opponentJoined,
+  gameStatus,
+  isTerminalActionInFlight,
+}: {
+  readonly isAuthenticated: boolean;
+  readonly playerColor: Player | null;
+  readonly opponentJoined: boolean;
+  readonly gameStatus: GameStatus;
+  readonly isTerminalActionInFlight: boolean;
+}): boolean {
+  return (
+    isAuthenticated &&
+    playerColor === 'black' &&
+    !opponentJoined &&
+    gameStatus === 'playing' &&
+    !isTerminalActionInFlight
+  );
+}
