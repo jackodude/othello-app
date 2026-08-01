@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  classifyPushProvider,
+  formatPushProvider,
   GLOBAL_PUSH_ENDPOINT_KEY,
   getPushPermissionState,
   getStoredPushEndpoint,
+  hasCompletePushSubscription,
   removeStoredPushEndpoint,
+  sanitizePushError,
   storePushEndpoint,
 } from './pushNotifications';
 
@@ -69,5 +73,49 @@ describe('push notification helpers', () => {
         hasStoredEndpoint: false,
       }),
     ).toBe('not-enabled');
+    expect(
+      getPushPermissionState({
+        isSupported: true,
+        permission: 'granted',
+        hasStoredEndpoint: false,
+        hasBrowserSubscription: true,
+      }),
+    ).toBe('enabled');
+  });
+
+  it('classifies common push providers without exposing endpoints', () => {
+    expect(classifyPushProvider('https://web.push.apple.com/Q123')).toBe('apple');
+    expect(classifyPushProvider('https://updates.push.apple.com/Q123')).toBe('apple');
+    expect(classifyPushProvider('https://fcm.googleapis.com/fcm/send/abc')).toBe(
+      'google-fcm',
+    );
+    expect(classifyPushProvider('https://updates.push.services.mozilla.com/wpush/v2/abc'))
+      .toBe('mozilla');
+    expect(classifyPushProvider('not a url')).toBeNull();
+    expect(formatPushProvider('apple')).toBe('Apple Web Push');
+  });
+
+  it('validates browser subscription JSON before registration', () => {
+    expect(
+      hasCompletePushSubscription({
+        endpoint: 'https://web.push.apple.com/Q123',
+        keys: { p256dh: 'p256dh', auth: 'auth' },
+      }),
+    ).toBe(true);
+    expect(
+      hasCompletePushSubscription({
+        endpoint: 'https://web.push.apple.com/Q123',
+        keys: { p256dh: '', auth: 'auth' },
+      }),
+    ).toBe(false);
+    expect(hasCompletePushSubscription(null)).toBe(false);
+  });
+
+  it('sanitizes push errors before displaying diagnostics', () => {
+    expect(
+      sanitizePushError(
+        new Error('Failed https://web.push.apple.com/very-secret-token ABCDEFGHIJKLMNOPQRSTUVWX'),
+      ),
+    ).toBe('Failed [push endpoint] [redacted]');
   });
 });

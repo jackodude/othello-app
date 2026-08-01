@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createInitialGameState, getScores } from '../src/game';
-import worker, { deriveNotificationEvent, sendNotificationEvent } from './index';
+import { applyMove, createInitialGameState, getScores } from '../src/game';
+import type { GameState, Position } from '../src/game';
+import worker, {
+  deriveNotificationEvent,
+  isTurnReminderDue,
+  sendDueTurnReminders,
+  sendNotificationEvent,
+} from './index';
 
 const API_ORIGIN = 'https://othello.test';
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -50,6 +56,25 @@ class FakeD1PreparedStatement {
         : null;
     }
 
+    if (this.sql.includes('FROM push_subscriptions')) {
+      const [gameId, playerColor, endpoint] = this.params;
+      const subscription = this.db.pushSubscriptions.find(
+        (pushSubscription) =>
+          pushSubscription.game_id === gameId &&
+          pushSubscription.player_color === playerColor &&
+          pushSubscription.endpoint === endpoint,
+      );
+
+      return subscription
+        ? ({
+            id: subscription.id,
+            endpoint: subscription.endpoint,
+            p256dh: subscription.p256dh,
+            auth: subscription.auth,
+          } as T)
+        : null;
+    }
+
     if (!this.sql.includes('SELECT')) {
       throw new Error(`Unsupported first() SQL: ${this.sql}`);
     }
@@ -63,6 +88,31 @@ class FakeD1PreparedStatement {
   }
 
   async all<T = unknown>(): Promise<D1Result<T>> {
+    if (this.sql.includes('FROM games')) {
+      const status = this.params[0];
+      const limit = Number(this.params[1] ?? Number.MAX_SAFE_INTEGER);
+      const results = [...this.db.rowsByCode.values()]
+        .filter(
+          (row) =>
+            row.status === status &&
+            row.black_joined === 1 &&
+            row.white_joined === 1 &&
+            typeof row.current_turn_started_at === 'string',
+        )
+        .sort((left, right) =>
+          String(left.current_turn_started_at).localeCompare(
+            String(right.current_turn_started_at),
+          ),
+        )
+        .slice(0, limit)
+        .map((row) => ({ ...row })) as T[];
+
+      return {
+        ...makeD1Result(0),
+        results,
+      };
+    }
+
     if (this.sql.includes('FROM push_subscriptions')) {
       const gameId = this.params[0];
       const playerColor = this.params[1];
@@ -238,6 +288,11 @@ class FakeD1PreparedStatement {
         whitePlayerName,
         endedReason,
         forfeitedBy,
+        rematchGameId,
+        rematchRequestedBy,
+        rematchRequestedAt,
+        currentTurnStartedAt,
+        lastTurnReminderSentAt,
       ] = this.params;
       const code = String(joinCode);
 
@@ -279,9 +334,11 @@ class FakeD1PreparedStatement {
         white_player_name: whitePlayerName,
         ended_reason: endedReason,
         forfeited_by: forfeitedBy,
-        rematch_game_id: null,
-        rematch_requested_by: null,
-        rematch_requested_at: null,
+        rematch_game_id: rematchGameId,
+        rematch_requested_by: rematchRequestedBy,
+        rematch_requested_at: rematchRequestedAt,
+        current_turn_started_at: currentTurnStartedAt,
+        last_turn_reminder_sent_at: lastTurnReminderSentAt,
       });
 
       return makeD1Result(1);
@@ -290,8 +347,8 @@ class FakeD1PreparedStatement {
     if (this.sql.includes('white_player_token_digest') && this.sql.includes('white_joined = 0')) {
       const whiteDigest = this.params[0];
       const nextVersion = this.params[1];
-      const joinCode = String(this.params[7]);
-      const inviteDigest = this.params[8];
+      const joinCode = String(this.params[8]);
+      const inviteDigest = this.params[9];
       const row = this.db.rowsByCode.get(joinCode);
 
       if (
@@ -312,7 +369,9 @@ class FakeD1PreparedStatement {
         white_invite_claimed_at: this.params[2],
         white_player_created_at: this.params[3],
         white_player_name: this.params[4],
-        updated_at: this.params[5],
+        current_turn_started_at: this.params[5],
+        last_turn_reminder_sent_at: null,
+        updated_at: this.params[6],
       });
 
       return makeD1Result(1);
@@ -321,8 +380,8 @@ class FakeD1PreparedStatement {
     if (this.sql.includes('black_player_token_digest') && this.sql.includes('black_joined = 0')) {
       const blackDigest = this.params[0];
       const nextVersion = this.params[1];
-      const joinCode = String(this.params[7]);
-      const inviteDigest = this.params[8];
+      const joinCode = String(this.params[8]);
+      const inviteDigest = this.params[9];
       const row = this.db.rowsByCode.get(joinCode);
 
       if (
@@ -342,7 +401,9 @@ class FakeD1PreparedStatement {
         black_invite_claimed_at: this.params[2],
         black_player_created_at: this.params[3],
         black_player_name: this.params[4],
-        updated_at: this.params[5],
+        current_turn_started_at: this.params[5],
+        last_turn_reminder_sent_at: null,
+        updated_at: this.params[6],
       });
 
       return makeD1Result(1);
@@ -411,6 +472,109 @@ class FakeD1PreparedStatement {
 
     if (
       this.sql.includes('UPDATE games') &&
+      this.sql.includes('last_turn_reminder_sent_at = ?') &&
+      this.sql.includes('current_turn_started_at = ?') &&
+      this.sql.includes('updated_at = updated_at')
+    ) {
+      const [
+        reminderSentAt,
+        id,
+        joinCode,
+        expectedVersion,
+        expectedStatus,
+        expectedPlayer,
+        expectedTurnStartedAt,
+        previousReminder,
+      ] = this.params;
+      const row = this.db.rowsByCode.get(String(joinCode));
+
+      if (
+        !row ||
+        row.id !== id ||
+        row.version !== expectedVersion ||
+        row.status !== expectedStatus ||
+        row.current_player !== expectedPlayer ||
+        row.current_turn_started_at !== expectedTurnStartedAt ||
+        (row.last_turn_reminder_sent_at ?? null) !== (previousReminder ?? null)
+      ) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(String(joinCode), {
+        ...row,
+        last_turn_reminder_sent_at: reminderSentAt,
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (
+      this.sql.includes('UPDATE games') &&
+      this.sql.includes('last_turn_reminder_sent_at = ?') &&
+      this.sql.includes('current_turn_started_at = ?') &&
+      this.sql.includes('last_turn_reminder_sent_at = ?')
+    ) {
+      const [
+        previousReminder,
+        id,
+        joinCode,
+        expectedVersion,
+        expectedStatus,
+        expectedPlayer,
+        expectedTurnStartedAt,
+        claimedReminder,
+      ] = this.params;
+      const row = this.db.rowsByCode.get(String(joinCode));
+
+      if (
+        !row ||
+        row.id !== id ||
+        row.version !== expectedVersion ||
+        row.status !== expectedStatus ||
+        row.current_player !== expectedPlayer ||
+        row.current_turn_started_at !== expectedTurnStartedAt ||
+        row.last_turn_reminder_sent_at !== claimedReminder
+      ) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(String(joinCode), {
+        ...row,
+        last_turn_reminder_sent_at: previousReminder,
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (
+      this.sql.includes('UPDATE games') &&
+      this.sql.includes('last_turn_reminder_sent_at = ?') &&
+      this.sql.includes('current_player = ?')
+    ) {
+      const [reminderSentAt, id, joinCode, expectedVersion, expectedStatus, expectedPlayer] =
+        this.params;
+      const row = this.db.rowsByCode.get(String(joinCode));
+
+      if (
+        !row ||
+        row.id !== id ||
+        row.version !== expectedVersion ||
+        row.status !== expectedStatus ||
+        row.current_player !== expectedPlayer
+      ) {
+        return makeD1Result(0);
+      }
+
+      this.db.rowsByCode.set(String(joinCode), {
+        ...row,
+        last_turn_reminder_sent_at: reminderSentAt,
+      });
+
+      return makeD1Result(1);
+    }
+
+    if (
+      this.sql.includes('UPDATE games') &&
       this.sql.includes('ended_reason') &&
       this.sql.includes('white_invite_token_digest = NULL')
     ) {
@@ -449,6 +613,8 @@ class FakeD1PreparedStatement {
         last_move_player: null,
         last_move_placed_index: null,
         last_move_flipped_indices_json: null,
+        current_turn_started_at: null,
+        last_turn_reminder_sent_at: null,
         updated_at: updatedAt,
       });
 
@@ -491,6 +657,8 @@ class FakeD1PreparedStatement {
         last_move_player: null,
         last_move_placed_index: null,
         last_move_flipped_indices_json: null,
+        current_turn_started_at: null,
+        last_turn_reminder_sent_at: null,
         updated_at: updatedAt,
       });
 
@@ -498,9 +666,9 @@ class FakeD1PreparedStatement {
     }
 
     if (this.sql.includes('UPDATE games')) {
-      const id = this.params[13];
-      const joinCode = String(this.params[14]);
-      const expectedVersion = this.params[15];
+      const id = this.params[14];
+      const joinCode = String(this.params[15]);
+      const expectedVersion = this.params[16];
       const currentRow = this.db.rowsByCode.get(joinCode);
 
       if (
@@ -525,6 +693,7 @@ class FakeD1PreparedStatement {
         lastMovePlayer,
         lastMovePlacedIndex,
         lastMoveFlippedIndicesJson,
+        currentTurnStartedAt,
         updatedAt,
       ] = this.params;
 
@@ -542,6 +711,8 @@ class FakeD1PreparedStatement {
         last_move_player: lastMovePlayer,
         last_move_placed_index: lastMovePlacedIndex,
         last_move_flipped_indices_json: lastMoveFlippedIndicesJson,
+        current_turn_started_at: currentTurnStartedAt,
+        last_turn_reminder_sent_at: null,
         updated_at: updatedAt,
       });
 
@@ -644,6 +815,11 @@ async function fetchJson(
       readonly progress?: number;
     }[];
     readonly enabled?: boolean;
+    readonly success?: boolean;
+    readonly provider?: string;
+    readonly httpStatus?: number | null;
+    readonly permanentFailure?: boolean;
+    readonly temporaryFailure?: boolean;
     readonly lastMove?: {
       readonly version?: number;
       readonly player?: string;
@@ -782,6 +958,43 @@ async function joinWhite(
       displayName === undefined ? { inviteToken } : { inviteToken, displayName },
     ),
   });
+}
+
+function findAutomaticPassScenario(): {
+  readonly state: GameState;
+  readonly move: Position;
+} {
+  const queue: GameState[] = [createInitialGameState()];
+  const seen = new Set<string>();
+
+  while (queue.length > 0) {
+    const state = queue.shift()!;
+    const key = JSON.stringify({
+      board: state.board,
+      currentPlayer: state.currentPlayer,
+      consecutivePasses: state.consecutivePasses,
+    });
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+
+    for (const move of state.legalMoves) {
+      const nextState = applyMove(state, move);
+      if (!nextState) {
+        continue;
+      }
+      if (
+        nextState.status === 'playing' &&
+        nextState.currentPlayer === state.currentPlayer
+      ) {
+        return { state, move };
+      }
+      queue.push(nextState);
+    }
+  }
+
+  throw new Error('Unable to find automatic pass scenario');
 }
 
 describe('authenticated game API', () => {
@@ -1518,6 +1731,77 @@ describe('authenticated game API', () => {
     expect(db.pushSubscriptions).toHaveLength(2);
   });
 
+  it('accepts Apple Web Push subscription endpoints', async () => {
+    const pushEnv = createPushEnv(db);
+    const pushMaterial = await createValidPushMaterial();
+    const created = await createGame(pushEnv);
+
+    const subscribed = await fetchJson(pushEnv, '/api/games/ABCDEF/push-subscriptions', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({
+        endpoint: 'https://web.push.apple.com/Q123',
+        keys: { p256dh: pushMaterial.p256dh, auth: pushMaterial.auth },
+      }),
+    });
+
+    expect(subscribed.response.status).toBe(200);
+    expect(db.pushSubscriptions).toHaveLength(1);
+    expect(db.pushSubscriptions[0].endpoint).toBe('https://web.push.apple.com/Q123');
+  });
+
+  it('sends an authenticated diagnostic push without recording a notification event', async () => {
+    const pushMaterial = await createValidPushMaterial();
+    const pushEnv = {
+      ...createPushEnv(db),
+      VAPID_PRIVATE_KEY: pushMaterial.privateJwk,
+    };
+    const created = await createGame(pushEnv);
+    await fetchJson(pushEnv, '/api/games/ABCDEF/push-subscriptions', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({
+        endpoint: 'https://web.push.apple.com/Q123',
+        keys: { p256dh: pushMaterial.p256dh, auth: pushMaterial.auth },
+      }),
+    });
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 201 }));
+
+    const tested = await fetchJson(pushEnv, '/api/push/test', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({
+        joinCode: 'ABCDEF',
+        endpoint: 'https://web.push.apple.com/Q123',
+      }),
+    });
+
+    expect(tested.response.status).toBe(200);
+    expect(tested.body.success).toBe(true);
+    expect(tested.body.provider).toBe('apple');
+    expect(tested.body.httpStatus).toBe(201);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(db.pushNotificationEvents).toHaveLength(0);
+  });
+
+  it('rejects diagnostic push requests for unregistered endpoints', async () => {
+    const pushEnv = createPushEnv(db);
+    const created = await createGame(pushEnv);
+
+    const tested = await fetchJson(pushEnv, '/api/push/test', {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+      body: JSON.stringify({
+        joinCode: 'ABCDEF',
+        endpoint: 'https://web.push.apple.com/missing',
+      }),
+    });
+
+    expect(tested.response.status).toBe(404);
+  });
+
   it('derives notification events without targeting the actor', async () => {
     await createGame(env);
     const game = Array.from(db.rowsByCode.values())[0]!;
@@ -1647,6 +1931,316 @@ describe('authenticated game API', () => {
     expect(response.status).toBe(201);
     expect(rematchEvents).toHaveLength(1);
     expect(rematchEvents[0].recipient_player_color).toBe('white');
+  });
+
+  it('calculates turn reminder intervals for the first day and later reminders', () => {
+    const turnStartedAt = '2026-01-01T00:00:00.000Z';
+
+    expect(
+      isTurnReminderDue({
+        turnStartedAt,
+        lastReminderSentAt: null,
+        now: new Date('2026-01-01T04:59:00.000Z'),
+      }),
+    ).toBe(false);
+    expect(
+      isTurnReminderDue({
+        turnStartedAt,
+        lastReminderSentAt: null,
+        now: new Date('2026-01-01T05:00:00.000Z'),
+      }),
+    ).toBe(true);
+    expect(
+      isTurnReminderDue({
+        turnStartedAt,
+        lastReminderSentAt: '2026-01-01T05:00:00.000Z',
+        now: new Date('2026-01-01T09:59:00.000Z'),
+      }),
+    ).toBe(false);
+    expect(
+      isTurnReminderDue({
+        turnStartedAt,
+        lastReminderSentAt: '2026-01-01T05:00:00.000Z',
+        now: new Date('2026-01-01T10:00:00.000Z'),
+      }),
+    ).toBe(true);
+    expect(
+      isTurnReminderDue({
+        turnStartedAt,
+        lastReminderSentAt: '2026-01-01T20:00:00.000Z',
+        now: new Date('2026-01-02T11:59:00.000Z'),
+      }),
+    ).toBe(false);
+    expect(
+      isTurnReminderDue({
+        turnStartedAt,
+        lastReminderSentAt: '2026-01-01T20:00:00.000Z',
+        now: new Date('2026-01-02T12:00:00.000Z'),
+      }),
+    ).toBe(true);
+  });
+
+  it('does not acknowledge turns on GET and uses explicit turn-seen instead', async () => {
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(env, joinCode, inviteToken);
+    const row = db.rowsByCode.get(joinCode)!;
+    db.rowsByCode.set(joinCode, {
+      ...row,
+      current_turn_started_at: '2026-01-01T00:00:00.000Z',
+      last_turn_reminder_sent_at: null,
+    });
+
+    await fetchJson(env, `/api/games/${joinCode}`, {
+      headers: auth(created.body.playerToken),
+    });
+    expect(db.rowsByCode.get(joinCode)?.last_turn_reminder_sent_at).toBeNull();
+
+    const seen = await fetchJson(env, `/api/games/${joinCode}/turn-seen`, {
+      method: 'POST',
+      headers: auth(created.body.playerToken),
+    });
+
+    expect(seen.response.status).toBe(200);
+    expect(db.rowsByCode.get(joinCode)?.last_turn_reminder_sent_at).toEqual(
+      expect.any(String),
+    );
+  });
+
+  it('resets turn reminder timing when the second player joins', async () => {
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    const beforeJoin = db.rowsByCode.get(joinCode)!;
+    db.rowsByCode.set(joinCode, {
+      ...beforeJoin,
+      current_turn_started_at: '2026-01-01T00:00:00.000Z',
+      last_turn_reminder_sent_at: '2026-01-01T05:00:00.000Z',
+    });
+
+    await joinWhite(env, joinCode, inviteToken);
+    const afterJoin = db.rowsByCode.get(joinCode)!;
+
+    expect(afterJoin.current_turn_started_at).not.toBe('2026-01-01T00:00:00.000Z');
+    expect(afterJoin.last_turn_reminder_sent_at).toBeNull();
+  });
+
+  it('sends due turn reminders and suppresses duplicate scheduled runs', async () => {
+    const pushMaterial = await createValidPushMaterial();
+    const pushEnv = {
+      ...createPushEnv(db),
+      VAPID_PRIVATE_KEY: pushMaterial.privateJwk,
+    };
+    const created = await createGame(pushEnv);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(pushEnv, joinCode, inviteToken);
+    const row = db.rowsByCode.get(joinCode)!;
+    db.rowsByCode.set(joinCode, {
+      ...row,
+      current_turn_started_at: '2026-01-01T00:00:00.000Z',
+      last_turn_reminder_sent_at: null,
+    });
+    db.pushSubscriptions.push({
+      id: 'sub-1',
+      game_id: created.body.id,
+      player_color: 'black',
+      endpoint: 'https://push.example/reminder',
+      p256dh: pushMaterial.p256dh,
+      auth: pushMaterial.auth,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    });
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 201 }));
+
+    await expect(
+      sendDueTurnReminders(
+        db as unknown as D1Database,
+        pushEnv,
+        new Date('2026-01-01T05:00:00.000Z'),
+      ),
+    ).resolves.toBe(1);
+    await expect(
+      sendDueTurnReminders(
+        db as unknown as D1Database,
+        pushEnv,
+        new Date('2026-01-01T05:00:00.000Z'),
+      ),
+    ).resolves.toBe(0);
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(db.rowsByCode.get(joinCode)?.last_turn_reminder_sent_at).toBe(
+      '2026-01-01T05:00:00.000Z',
+    );
+  });
+
+  it('keeps failed reminder delivery retryable without advancing the sent timestamp', async () => {
+    const pushMaterial = await createValidPushMaterial();
+    const pushEnv = {
+      ...createPushEnv(db),
+      VAPID_PRIVATE_KEY: pushMaterial.privateJwk,
+    };
+    const created = await createGame(pushEnv);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    await joinWhite(pushEnv, joinCode, inviteToken);
+    const row = db.rowsByCode.get(joinCode)!;
+    db.rowsByCode.set(joinCode, {
+      ...row,
+      current_turn_started_at: '2026-01-01T00:00:00.000Z',
+      last_turn_reminder_sent_at: null,
+    });
+    db.pushSubscriptions.push({
+      id: 'sub-1',
+      game_id: created.body.id,
+      player_color: 'black',
+      endpoint: 'https://push.example/temporary-failure',
+      p256dh: pushMaterial.p256dh,
+      auth: pushMaterial.auth,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    });
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(null, { status: 201 }));
+
+    await expect(
+      sendDueTurnReminders(
+        db as unknown as D1Database,
+        pushEnv,
+        new Date('2026-01-01T05:00:00.000Z'),
+      ),
+    ).resolves.toBe(0);
+    expect(db.rowsByCode.get(joinCode)?.last_turn_reminder_sent_at).toBeNull();
+
+    await expect(
+      sendDueTurnReminders(
+        db as unknown as D1Database,
+        pushEnv,
+        new Date('2026-01-01T05:01:00.000Z'),
+      ),
+    ).resolves.toBe(1);
+    expect(db.rowsByCode.get(joinCode)?.last_turn_reminder_sent_at).toBe(
+      '2026-01-01T05:01:00.000Z',
+    );
+  });
+
+  it('retains turn start time when a move causes an automatic pass', async () => {
+    const scenario = findAutomaticPassScenario();
+    const created = await createGame(env);
+    const { joinCode, inviteToken } = splitInvitation(created.body.invitation!);
+    const joined = await joinWhite(env, joinCode, inviteToken);
+    const scores = getScores(scenario.state.board);
+    const row = db.rowsByCode.get(joinCode)!;
+    const currentPlayerToken =
+      scenario.state.currentPlayer === 'black'
+        ? created.body.playerToken
+        : joined.body.playerToken;
+    db.rowsByCode.set(joinCode, {
+      ...row,
+      board_json: JSON.stringify(scenario.state.board),
+      current_player: scenario.state.currentPlayer,
+      status: scenario.state.status,
+      winner: null,
+      black_score: scores.black,
+      white_score: scores.white,
+      consecutive_passes: scenario.state.consecutivePasses,
+      version: 7,
+      current_turn_started_at: '2026-01-01T00:00:00.000Z',
+      last_turn_reminder_sent_at: '2026-01-01T05:00:00.000Z',
+    });
+
+    const moved = await fetchJson(env, `/api/games/${joinCode}/moves`, {
+      method: 'POST',
+      headers: auth(currentPlayerToken),
+      body: JSON.stringify({
+        row: scenario.move.row,
+        col: scenario.move.col,
+        expectedVersion: 7,
+      }),
+    });
+
+    expect(moved.response.status).toBe(200);
+    expect(moved.body.state?.currentPlayer).toBe(scenario.state.currentPlayer);
+    expect(db.rowsByCode.get(joinCode)?.current_turn_started_at).toBe(
+      '2026-01-01T00:00:00.000Z',
+    );
+    expect(db.rowsByCode.get(joinCode)?.last_turn_reminder_sent_at).toBeNull();
+  });
+
+  it('does not send reminders after a move, game finish, forfeit, or cancellation', async () => {
+    const pushMaterial = await createValidPushMaterial();
+    const pushEnv = {
+      ...createPushEnv(db),
+      VAPID_PRIVATE_KEY: pushMaterial.privateJwk,
+    };
+    mockJoinCodes(['ABCDEF', 'GHJKLM', 'NPQRST', 'UVWXYZ']);
+    const active = await fetchJson(pushEnv, '/api/games', { method: 'POST' });
+    const activeInvite = splitInvitation(active.body.invitation!);
+    await joinWhite(pushEnv, activeInvite.joinCode, activeInvite.inviteToken);
+    const finished = await fetchJson(pushEnv, '/api/games', { method: 'POST' });
+    const finishedInvite = splitInvitation(finished.body.invitation!);
+    await joinWhite(pushEnv, finishedInvite.joinCode, finishedInvite.inviteToken);
+    finishGame(db, finished.body.joinCode!);
+    const forfeited = await fetchJson(pushEnv, '/api/games', { method: 'POST' });
+    const forfeitedInvite = splitInvitation(forfeited.body.invitation!);
+    await joinWhite(pushEnv, forfeitedInvite.joinCode, forfeitedInvite.inviteToken);
+    const forfeitedRow = db.rowsByCode.get(forfeited.body.joinCode!)!;
+    db.rowsByCode.set(forfeited.body.joinCode!, {
+      ...forfeitedRow,
+      current_turn_started_at: '2026-01-01T00:00:00.000Z',
+    });
+    await fetchJson(pushEnv, `/api/games/${forfeited.body.joinCode}/forfeit`, {
+      method: 'POST',
+      headers: auth(forfeited.body.playerToken),
+    });
+    const cancelled = await fetchJson(pushEnv, '/api/games', { method: 'POST' });
+    const cancelledRow = db.rowsByCode.get(cancelled.body.joinCode!)!;
+    db.rowsByCode.set(cancelled.body.joinCode!, {
+      ...cancelledRow,
+      current_turn_started_at: '2026-01-01T00:00:00.000Z',
+    });
+    await fetchJson(pushEnv, `/api/games/${cancelled.body.joinCode}/cancel`, {
+      method: 'POST',
+      headers: auth(cancelled.body.playerToken),
+    });
+
+    for (const game of [active.body, finished.body, forfeited.body, cancelled.body]) {
+      db.pushSubscriptions.push({
+        id: `sub-${game.joinCode}`,
+        game_id: game.id,
+        player_color: 'black',
+        endpoint: `https://push.example/${game.joinCode}`,
+        p256dh: pushMaterial.p256dh,
+        auth: pushMaterial.auth,
+        created_at: '2026-01-01T00:00:00.000Z',
+        updated_at: '2026-01-01T00:00:00.000Z',
+      });
+    }
+
+    const activeRow = db.rowsByCode.get(active.body.joinCode!)!;
+    db.rowsByCode.set(active.body.joinCode!, {
+      ...activeRow,
+      current_turn_started_at: '2026-01-01T00:00:00.000Z',
+      last_turn_reminder_sent_at: null,
+    });
+    await fetchJson(pushEnv, `/api/games/${active.body.joinCode}/moves`, {
+      method: 'POST',
+      headers: auth(active.body.playerToken),
+      body: JSON.stringify({ row: 2, col: 3, expectedVersion: 2 }),
+    });
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 201 }));
+
+    await expect(
+      sendDueTurnReminders(
+        db as unknown as D1Database,
+        pushEnv,
+        new Date('2026-01-01T06:00:00.000Z'),
+      ),
+    ).resolves.toBe(0);
+
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('removes permanently stale subscriptions and records failed delivery state', async () => {

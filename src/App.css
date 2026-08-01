@@ -451,6 +451,36 @@
   color: var(--text-secondary);
 }
 
+.notification-panel__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  justify-content: flex-end;
+}
+
+.notification-panel__diagnostics {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.notification-panel__diagnostics div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.notification-panel__diagnostics dt {
+  font-weight: 700;
+}
+
+.notification-panel__diagnostics dd {
+  margin: 0;
+}
+
 .token-input {
   min-width: 0;
   border: 1px solid var(--border);

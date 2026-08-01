@@ -48,40 +48,90 @@ self.addEventListener('fetch', (event) => {
 });
 
 self.addEventListener('push', (event) => {
-  const payload = event.data?.json() ?? {};
-  const title = typeof payload.title === 'string' ? payload.title : 'Othello';
-
   event.waitUntil(
-    self.clients
-      .matchAll({ type: 'window', includeUncontrolled: true })
-      .then((clients) => {
-        const hasVisibleWindow = clients.some(
-          (client) => client.visibilityState === 'visible',
-        );
-
-        if (hasVisibleWindow) {
-          return undefined;
-        }
-
-        return self.registration.showNotification(title, {
-          body: typeof payload.body === 'string' ? payload.body : 'Open your game.',
-          icon: typeof payload.icon === 'string' ? payload.icon : '/pwa-icon-192.png',
-          badge: typeof payload.badge === 'string' ? payload.badge : '/pwa-icon-192.png',
-          tag: typeof payload.tag === 'string' ? payload.tag : undefined,
-          data: payload.data && typeof payload.data === 'object' ? payload.data : {},
-        });
-      })
-      .catch(() =>
-        self.registration.showNotification(title, {
-          body: typeof payload.body === 'string' ? payload.body : 'Open your game.',
-          icon: typeof payload.icon === 'string' ? payload.icon : '/pwa-icon-192.png',
-          badge: typeof payload.badge === 'string' ? payload.badge : '/pwa-icon-192.png',
-          tag: typeof payload.tag === 'string' ? payload.tag : undefined,
-          data: payload.data && typeof payload.data === 'object' ? payload.data : {},
-        }),
-      ),
+    handlePushNotification(event),
   );
 });
+
+async function handlePushNotification(event) {
+  const payload = readPushPayload(event);
+  const title = typeof payload.title === 'string' ? payload.title : 'Othello';
+  const body = typeof payload.body === 'string' ? payload.body : 'Open your game.';
+  const data = getNotificationData(payload);
+  let appClients = [];
+  try {
+    appClients = await self.clients.matchAll({
+      type: 'window',
+      includeUncontrolled: true,
+    });
+  } catch {
+    appClients = [];
+  }
+  const hasVisibleWindow = appClients.some((client) => {
+    try {
+      return (
+        new URL(client.url).origin === self.location.origin &&
+        client.visibilityState === 'visible'
+      );
+    } catch {
+      return false;
+    }
+  });
+
+  if (hasVisibleWindow) {
+    return;
+  }
+
+  const options = {
+    body,
+    data,
+  };
+  if (typeof payload.icon === 'string') {
+    options.icon = payload.icon;
+  } else {
+    options.icon = '/pwa-icon-192.png';
+  }
+  if (typeof payload.badge === 'string') {
+    options.badge = payload.badge;
+  }
+  if (typeof payload.tag === 'string') {
+    options.tag = payload.tag;
+  }
+
+  try {
+    await self.registration.showNotification(title, options);
+  } catch {
+    await self.registration.showNotification(title, { body, data });
+  }
+}
+
+function readPushPayload(event) {
+  try {
+    return event.data?.json() ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function getNotificationData(payload) {
+  if (!payload.data || typeof payload.data !== 'object') {
+    return {};
+  }
+
+  const data = { ...payload.data };
+  if (typeof data.url !== 'string') {
+    return data;
+  }
+
+  try {
+    const url = new URL(data.url, self.location.origin);
+    data.url = url.origin === self.location.origin ? `${url.pathname}${url.search}` : '/';
+  } catch {
+    data.url = '/';
+  }
+
+  return data;
+}
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();

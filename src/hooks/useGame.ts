@@ -306,6 +306,23 @@ async function skipGameToEnd(
   );
 }
 
+async function acknowledgeTurnSeen(
+  joinCode: string,
+  playerToken: string,
+): Promise<void> {
+  const response = await fetch(
+    `/api/games/${encodeURIComponent(normalizeJoinCode(joinCode))}/turn-seen`,
+    {
+      method: 'POST',
+      headers: authorizationHeaders(playerToken),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Turn acknowledgement failed with status ${response.status}`);
+  }
+}
+
 function getErrorKind(error: unknown): GameErrorKind {
   if (error instanceof Error && error.name === 'UnauthorizedError') {
     return 'unauthorized';
@@ -1131,6 +1148,25 @@ export function useGame({
       ? game.invitation ?? readStoredInvitation(game.joinCode)
       : null;
 
+  const acknowledgeCurrentTurn = useCallback(async () => {
+    if (
+      !game ||
+      !selectedJoinCode ||
+      !playerToken ||
+      !game.opponentJoined ||
+      game.state.status !== 'playing' ||
+      game.playerColor !== game.state.currentPlayer
+    ) {
+      return;
+    }
+
+    try {
+      await acknowledgeTurnSeen(selectedJoinCode, playerToken);
+    } catch {
+      // Turn acknowledgement is best-effort; gameplay and polling remain authoritative.
+    }
+  }, [game, playerToken, selectedJoinCode]);
+
   return {
     gameState,
     joinCode: game?.joinCode ?? selectedJoinCode,
@@ -1164,6 +1200,7 @@ export function useGame({
     clearCredential,
     switchGame,
     removeSavedGameFromHistory,
+    acknowledgeCurrentTurn,
     hasSelectedGame: game !== null,
     showGameSelection: !game || isSwitchingGame,
     isLoading,

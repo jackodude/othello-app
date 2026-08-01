@@ -17,10 +17,14 @@ import {
   shouldShowIosInstallGuidance,
 } from './hooks/installPrompt';
 import {
+  classifyPushProvider,
+  formatPushProvider,
   getPushPermissionState,
   getStoredPushEndpoint,
+  hasCompletePushSubscription,
   isPushSupported,
   removeStoredPushEndpoint,
+  sanitizePushError,
   storePushEndpoint,
   urlBase64ToArrayBuffer,
   type PushPermissionState,
@@ -58,6 +62,25 @@ interface BeforeInstallPromptEvent extends Event {
   readonly prompt: () => Promise<void>;
 }
 
+interface PushRegistrationSummary {
+  readonly successful: number;
+  readonly attempted: number;
+  readonly savedGameCount: number;
+  readonly currentGameRegistered: boolean | null;
+  readonly lastError: string | null;
+}
+
+interface PushDiagnostics {
+  readonly hasBrowserSubscription: boolean;
+  readonly providerLabel: string;
+  readonly registeredCount: number;
+  readonly attemptedCount: number;
+  readonly savedGameCount: number;
+  readonly currentGameRegistered: boolean | null;
+  readonly lastError: string | null;
+  readonly testResult: string | null;
+}
+
 function App() {
   const [preferences, setPreferences] = useState(() => {
     if (typeof window === 'undefined') {
@@ -93,6 +116,7 @@ function App() {
     opponentJoined,
     isAuthenticated,
     isYourTurn,
+    version,
     scores,
     result,
     playMove,
@@ -107,6 +131,7 @@ function App() {
     switchGame,
     loadGame,
     removeSavedGameFromHistory,
+    acknowledgeCurrentTurn,
     syncDisplayNameToSavedGames,
     hasSelectedGame,
     showGameSelection,
@@ -166,6 +191,9 @@ function App() {
 
     return navigator.onLine;
   });
+  const [isDocumentVisible, setIsDocumentVisible] = useState(() =>
+    typeof document === 'undefined' ? true : document.visibilityState === 'visible',
+  );
   const [notificationPermission, setNotificationPermission] =
     useState<NotificationPermission>(() => {
       if (typeof Notification === 'undefined') {
@@ -176,6 +204,17 @@ function App() {
     });
   const [isNotificationBusy, setIsNotificationBusy] = useState(false);
   const [notificationMessage, setNotificationMessage] = useState<string | null>(null);
+  const [pushDiagnostics, setPushDiagnostics] = useState<PushDiagnostics>({
+    hasBrowserSubscription: false,
+    providerLabel: 'Unknown',
+    registeredCount: 0,
+    attemptedCount: 0,
+    savedGameCount: 0,
+    currentGameRegistered: null,
+    lastError: null,
+    testResult: null,
+  });
+  const acknowledgedTurnRef = useRef<string | null>(null);
   useEffect(() => {
     function handleBeforeInstallPrompt(event: Event) {
       event.preventDefault();
@@ -193,14 +232,20 @@ function App() {
       setIsOnline(false);
     }
 
+    function handleVisibilityChange() {
+      setIsDocumentVisible(document.visibilityState === 'visible');
+    }
+
     window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, []);
 
@@ -276,6 +321,38 @@ function App() {
   const visibleRecentPositions = preferences.highlightLastMove
     ? recentPositions
     : [];
+
+  useEffect(() => {
+    if (
+      !joinCode ||
+      version === null ||
+      !isAuthenticated ||
+      !opponentJoined ||
+      gameState.status !== 'playing' ||
+      !isYourTurn ||
+      !isDocumentVisible
+    ) {
+      return;
+    }
+
+    const turnKey = `${joinCode}:${version}:${gameState.currentPlayer}`;
+    if (acknowledgedTurnRef.current === turnKey) {
+      return;
+    }
+
+    acknowledgedTurnRef.current = turnKey;
+    void acknowledgeCurrentTurn();
+  }, [
+    acknowledgeCurrentTurn,
+    gameState.currentPlayer,
+    gameState.status,
+    isAuthenticated,
+    isDocumentVisible,
+    isYourTurn,
+    joinCode,
+    opponentJoined,
+    version,
+  ]);
 
   function updatePreference<Key extends keyof typeof preferences>(
     key: Key,
@@ -375,35 +452,64 @@ function App() {
 
   const registerSubscriptionForSavedGames = useCallback(async (
     subscriptionJson: PushSubscriptionJSON,
-  ): Promise<boolean> => {
+  ): Promise<PushRegistrationSummary> => {
     if (savedGames.length === 0) {
-      return true;
+      return {
+        successful: 0,
+        attempted: 0,
+        savedGameCount: 0,
+        currentGameRegistered: null,
+        lastError: null,
+      };
     }
 
     const registrations = savedGames.map(async (savedGame) => {
       const savedPlayerToken = readSavedPlayerToken(savedGame.joinCode);
       if (!savedPlayerToken) {
-        return false;
+        return { joinCode: savedGame.joinCode, ok: false, error: 'Missing saved credential.' };
       }
 
-      const response = await fetch(
-        `/api/games/${encodeURIComponent(savedGame.joinCode)}/push-subscriptions`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${savedPlayerToken}`,
+      try {
+        const response = await fetch(
+          `/api/games/${encodeURIComponent(savedGame.joinCode)}/push-subscriptions`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${savedPlayerToken}`,
+            },
+            body: JSON.stringify(subscriptionJson),
           },
-          body: JSON.stringify(subscriptionJson),
-        },
-      );
+        );
 
-      return response.ok;
+        return {
+          joinCode: savedGame.joinCode,
+          ok: response.ok,
+          error: response.ok ? null : `Registration failed with ${response.status}.`,
+        };
+      } catch (error) {
+        return {
+          joinCode: savedGame.joinCode,
+          ok: false,
+          error: sanitizePushError(error),
+        };
+      }
     });
 
     const results = await Promise.all(registrations);
-    return results.some(Boolean);
-  }, [readSavedPlayerToken, savedGames]);
+    const selectedJoinCode = joinCode?.trim().toUpperCase() ?? null;
+    const currentResult = selectedJoinCode
+      ? results.find((result) => result.joinCode.trim().toUpperCase() === selectedJoinCode)
+      : undefined;
+
+    return {
+      successful: results.filter((result) => result.ok).length,
+      attempted: results.length,
+      savedGameCount: savedGames.length,
+      currentGameRegistered: currentResult ? currentResult.ok : null,
+      lastError: results.find((result) => !result.ok)?.error ?? null,
+    };
+  }, [joinCode, readSavedPlayerToken, savedGames]);
 
   const unregisterSubscriptionForSavedGames = useCallback(async (
     subscriptionJson: PushSubscriptionJSON,
@@ -426,6 +532,26 @@ function App() {
       }),
     );
   }, [readSavedPlayerToken, savedGames]);
+
+  const updatePushDiagnostics = useCallback((
+    subscription: PushSubscription | null,
+    registrationSummary?: PushRegistrationSummary,
+    updates?: Partial<Pick<PushDiagnostics, 'lastError' | 'testResult'>>,
+  ) => {
+    const endpoint = subscription?.endpoint ?? storedPushEndpoint;
+    setPushDiagnostics((current) => ({
+      ...current,
+      hasBrowserSubscription: Boolean(subscription),
+      providerLabel: formatPushProvider(classifyPushProvider(endpoint)),
+      registeredCount: registrationSummary?.successful ?? current.registeredCount,
+      attemptedCount: registrationSummary?.attempted ?? current.attemptedCount,
+      savedGameCount: registrationSummary?.savedGameCount ?? savedGames.length,
+      currentGameRegistered:
+        registrationSummary?.currentGameRegistered ?? current.currentGameRegistered,
+      lastError: updates?.lastError ?? registrationSummary?.lastError ?? current.lastError,
+      testResult: updates?.testResult ?? current.testResult,
+    }));
+  }, [savedGames.length, storedPushEndpoint]);
 
   async function handleEnableNotifications() {
     if (!isPushSupported()) {
@@ -450,20 +576,32 @@ function App() {
       }
 
       const registration = await navigator.serviceWorker.ready;
-      const subscription = await registration.pushManager.subscribe({
+      const existingSubscription = await registration.pushManager.getSubscription();
+      const subscription = existingSubscription ?? await registration.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: urlBase64ToArrayBuffer(publicKey),
       });
-
-      if (!(await registerSubscriptionForSavedGames(subscription.toJSON()))) {
-        await subscription.unsubscribe();
+      const subscriptionJson = subscription.toJSON();
+      if (!hasCompletePushSubscription(subscriptionJson)) {
         setNotificationMessage('Unable to enable notifications.');
+        updatePushDiagnostics(subscription, undefined, {
+          lastError: 'Browser returned an incomplete push subscription.',
+        });
         return;
       }
 
+      const registrationSummary = await registerSubscriptionForSavedGames(subscriptionJson);
       storePushEndpoint(window.localStorage, subscription.endpoint);
-      setNotificationMessage('Notifications enabled.');
-    } catch {
+      updatePushDiagnostics(subscription, registrationSummary, { lastError: null });
+      setNotificationMessage(
+        registrationSummary.savedGameCount > 0 &&
+        registrationSummary.successful === 0
+          ? 'Notifications are enabled in this browser, but no saved games were registered.'
+          : 'Notifications enabled.',
+      );
+    } catch (error) {
+      const message = sanitizePushError(error);
+      updatePushDiagnostics(null, undefined, { lastError: message });
       setNotificationMessage('Unable to enable notifications.');
     } finally {
       setIsNotificationBusy(false);
@@ -492,16 +630,108 @@ function App() {
       }
 
       removeStoredPushEndpoint(window.localStorage);
+      updatePushDiagnostics(null, {
+        successful: 0,
+        attempted: 0,
+        savedGameCount: savedGames.length,
+        currentGameRegistered: null,
+        lastError: null,
+      }, { testResult: null });
       setNotificationMessage('Notifications disabled.');
-    } catch {
+    } catch (error) {
+      updatePushDiagnostics(null, undefined, { lastError: sanitizePushError(error) });
       setNotificationMessage('Unable to disable notifications.');
     } finally {
       setIsNotificationBusy(false);
     }
   }
 
+  async function handleSendTestNotification() {
+    if (!isPushSupported()) {
+      return;
+    }
+
+    setIsNotificationBusy(true);
+    setNotificationMessage(null);
+
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      const subscriptionJson = subscription?.toJSON();
+      if (!subscription || !hasCompletePushSubscription(subscriptionJson)) {
+        setNotificationMessage('No active push subscription found.');
+        updatePushDiagnostics(subscription ?? null, undefined, {
+          lastError: 'No active push subscription found.',
+        });
+        return;
+      }
+
+      const preferredGame = joinCode
+        ? savedGames.find(
+            (savedGame) =>
+              savedGame.joinCode.trim().toUpperCase() === joinCode.trim().toUpperCase(),
+          )
+        : undefined;
+      const savedGame = preferredGame ?? savedGames.find(
+        (candidate) => Boolean(readSavedPlayerToken(candidate.joinCode)),
+      );
+      if (!savedGame) {
+        setNotificationMessage('Save or open a game before sending a test notification.');
+        updatePushDiagnostics(subscription, undefined, {
+          lastError: 'No saved game credential is available for a test notification.',
+        });
+        return;
+      }
+
+      const playerToken = readSavedPlayerToken(savedGame.joinCode);
+      if (!playerToken) {
+        setNotificationMessage('No saved credential is available for this game.');
+        updatePushDiagnostics(subscription, undefined, {
+          lastError: 'No saved credential is available for this game.',
+        });
+        return;
+      }
+
+      const response = await fetch('/api/push/test', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${playerToken}`,
+        },
+        body: JSON.stringify({
+          joinCode: savedGame.joinCode,
+          endpoint: subscription.endpoint,
+        }),
+      });
+      const body = (await response.json()) as {
+        readonly success?: boolean;
+        readonly provider?: string;
+        readonly httpStatus?: number | null;
+        readonly permanentFailure?: boolean;
+        readonly temporaryFailure?: boolean;
+        readonly error?: string | null;
+      };
+      const resultMessage = body.success
+        ? `Test notification accepted by ${body.provider ?? 'push service'}.`
+        : `Test notification failed${
+            body.httpStatus ? ` with HTTP ${body.httpStatus}` : ''
+          }.`;
+      updatePushDiagnostics(subscription, undefined, {
+        testResult: resultMessage,
+        lastError: body.success ? null : body.error ?? resultMessage,
+      });
+      setNotificationMessage(resultMessage);
+    } catch (error) {
+      const message = sanitizePushError(error);
+      updatePushDiagnostics(null, undefined, { lastError: message });
+      setNotificationMessage('Unable to send a test notification.');
+    } finally {
+      setIsNotificationBusy(false);
+    }
+  }
+
   useEffect(() => {
-    if (!storedPushEndpoint || notificationPermission !== 'granted' || !isPushSupported()) {
+    if (notificationPermission !== 'granted' || !isPushSupported()) {
       return;
     }
 
@@ -512,11 +742,31 @@ function App() {
         const registration = await navigator.serviceWorker.ready;
         const subscription = await registration.pushManager.getSubscription();
         if (!isActive || !subscription) {
+          if (isActive) {
+            updatePushDiagnostics(null);
+          }
           return;
         }
 
-        await registerSubscriptionForSavedGames(subscription.toJSON());
-      } catch {
+        const subscriptionJson = subscription.toJSON();
+        if (!hasCompletePushSubscription(subscriptionJson)) {
+          if (isActive) {
+            updatePushDiagnostics(subscription, undefined, {
+              lastError: 'Browser returned an incomplete push subscription.',
+            });
+          }
+          return;
+        }
+
+        const registrationSummary = await registerSubscriptionForSavedGames(subscriptionJson);
+        if (isActive) {
+          storePushEndpoint(window.localStorage, subscription.endpoint);
+          updatePushDiagnostics(subscription, registrationSummary);
+        }
+      } catch (error) {
+        if (isActive) {
+          updatePushDiagnostics(null, undefined, { lastError: sanitizePushError(error) });
+        }
         // Keep gameplay and the saved preference intact; explicit settings actions report errors.
       }
     }
@@ -526,7 +776,7 @@ function App() {
     return () => {
       isActive = false;
     };
-  }, [notificationPermission, registerSubscriptionForSavedGames, storedPushEndpoint]);
+  }, [notificationPermission, registerSubscriptionForSavedGames, updatePushDiagnostics]);
 
   function handleSkipToEnd() {
     if (!window.confirm('Finish this game immediately for testing?')) {
@@ -709,14 +959,24 @@ function App() {
               </p>
             </div>
             {pushState === 'enabled' ? (
-              <button
-                type="button"
-                className="load-game-button"
-                disabled={isNotificationBusy}
-                onClick={() => void handleDisableNotifications()}
-              >
-                Disable
-              </button>
+              <div className="notification-panel__actions">
+                <button
+                  type="button"
+                  className="load-game-button"
+                  disabled={isNotificationBusy}
+                  onClick={() => void handleSendTestNotification()}
+                >
+                  Send test
+                </button>
+                <button
+                  type="button"
+                  className="load-game-button"
+                  disabled={isNotificationBusy}
+                  onClick={() => void handleDisableNotifications()}
+                >
+                  Disable
+                </button>
+              </div>
             ) : (
               <button
                 type="button"
@@ -732,6 +992,39 @@ function App() {
                 {notificationMessage}
               </span>
             )}
+            <dl className="notification-panel__diagnostics" aria-label="Notification diagnostics">
+              <div>
+                <dt>Browser subscription</dt>
+                <dd>{pushDiagnostics.hasBrowserSubscription ? 'Found' : 'Not found'}</dd>
+              </div>
+              <div>
+                <dt>Push service</dt>
+                <dd>{pushDiagnostics.providerLabel}</dd>
+              </div>
+              <div>
+                <dt>Registered games</dt>
+                <dd>
+                  {pushDiagnostics.registeredCount}/{pushDiagnostics.savedGameCount}
+                  {pushDiagnostics.currentGameRegistered === null
+                    ? ''
+                    : pushDiagnostics.currentGameRegistered
+                      ? ' (current game ready)'
+                      : ' (current game not registered)'}
+                </dd>
+              </div>
+              {pushDiagnostics.testResult && (
+                <div>
+                  <dt>Test</dt>
+                  <dd>{pushDiagnostics.testResult}</dd>
+                </div>
+              )}
+              {pushDiagnostics.lastError && (
+                <div>
+                  <dt>Last issue</dt>
+                  <dd>{pushDiagnostics.lastError}</dd>
+                </div>
+              )}
+            </dl>
           </div>
         </section>
       )}

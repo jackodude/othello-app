@@ -140,6 +140,8 @@ interface GameRow {
   readonly rematch_game_id?: string | null;
   readonly rematch_requested_by?: string | null;
   readonly rematch_requested_at?: string | null;
+  readonly current_turn_started_at?: string | null;
+  readonly last_turn_reminder_sent_at?: string | null;
 }
 
 interface StoredGame {
@@ -167,6 +169,8 @@ interface StoredGame {
   readonly rematchGameId: string | null;
   readonly rematchRequestedBy: Player | null;
   readonly rematchRequestedAt: string | null;
+  readonly currentTurnStartedAt?: string | null;
+  readonly lastTurnReminderSentAt?: string | null;
   readonly rematchGame?: StoredGame | null;
 }
 
@@ -190,7 +194,8 @@ type NotificationEventType =
   | 'white_joined'
   | 'your_turn'
   | 'game_finished'
-  | 'rematch_requested';
+  | 'rematch_requested'
+  | 'turn_reminder';
 
 interface NotificationEvent {
   readonly eventType: NotificationEventType;
@@ -206,11 +211,30 @@ interface PushSubscriptionRow {
   readonly auth: string;
 }
 
+interface PushDeliveryAttempt {
+  readonly provider: string;
+  readonly success: boolean;
+  readonly httpStatus: number | null;
+  readonly permanentFailure: boolean;
+  readonly temporaryFailure: boolean;
+  readonly error: string | null;
+}
+
 interface PushNotificationEventRow {
   readonly id: string;
   readonly delivery_state: 'pending' | 'sent' | 'failed';
   readonly attempts: number;
 }
+
+interface ReminderCandidateRow extends GameRow {
+  readonly current_turn_started_at: string;
+  readonly last_turn_reminder_sent_at: string | null;
+}
+
+const FIRST_DAY_REMINDER_INTERVAL_MS = 5 * 60 * 60 * 1000;
+const LATER_REMINDER_INTERVAL_MS = 16 * 60 * 60 * 1000;
+const FIRST_DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_TURN_REMINDERS_PER_RUN = 50;
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return Response.json(body, init);
@@ -222,6 +246,39 @@ function errorResponse(status: number, message: string): Response {
 
 function isPushConfigured(env: WorkerEnv): boolean {
   return Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY && env.VAPID_SUBJECT);
+}
+
+function classifyPushProvider(endpoint: string): string {
+  try {
+    const hostname = new URL(endpoint).hostname.toLowerCase();
+    if (
+      hostname === 'web.push.apple.com' ||
+      hostname.endsWith('.push.apple.com') ||
+      (hostname.includes('apple') && hostname.includes('push'))
+    ) {
+      return 'apple';
+    }
+    if (hostname.includes('fcm.googleapis.com') || hostname.includes('googleapis.com')) {
+      return 'google-fcm';
+    }
+    if (hostname.includes('mozilla.com')) {
+      return 'mozilla';
+    }
+  } catch {
+    return 'unknown';
+  }
+
+  return 'other';
+}
+
+function sanitizePushError(error: unknown): string {
+  if (!(error instanceof Error) || !error.message) {
+    return 'Push delivery failed';
+  }
+
+  return error.message
+    .replace(/https:\/\/[^\s")]+/giu, '[push endpoint]')
+    .replace(/[A-Za-z0-9_-]{24,}/gu, '[redacted]');
 }
 
 function isTestControlsEnabled(env: WorkerEnv): boolean {
@@ -582,7 +639,13 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
       !isPlayer(row.rematch_requested_by)) ||
     (row.rematch_requested_at !== null &&
       row.rematch_requested_at !== undefined &&
-      typeof row.rematch_requested_at !== 'string')
+      typeof row.rematch_requested_at !== 'string') ||
+    (row.current_turn_started_at !== null &&
+      row.current_turn_started_at !== undefined &&
+      typeof row.current_turn_started_at !== 'string') ||
+    (row.last_turn_reminder_sent_at !== null &&
+      row.last_turn_reminder_sent_at !== undefined &&
+      typeof row.last_turn_reminder_sent_at !== 'string')
   ) {
     return null;
   }
@@ -665,6 +728,8 @@ function rowToStoredGame(row: GameRow): StoredGame | null {
     rematchGameId: row.rematch_game_id ?? null,
     rematchRequestedBy: row.rematch_requested_by ?? null,
     rematchRequestedAt: row.rematch_requested_at ?? null,
+    currentTurnStartedAt: row.current_turn_started_at ?? null,
+    lastTurnReminderSentAt: row.last_turn_reminder_sent_at ?? null,
   };
 }
 
@@ -874,7 +939,8 @@ async function getGameByJoinCode(
               last_move_version, last_move_player, last_move_placed_index,
               last_move_flipped_indices_json, black_player_name, white_player_name,
               ended_reason, forfeited_by, rematch_game_id,
-              rematch_requested_by, rematch_requested_at
+              rematch_requested_by, rematch_requested_at,
+              current_turn_started_at, last_turn_reminder_sent_at
        FROM games
        WHERE join_code = ?`,
     )
@@ -896,6 +962,45 @@ async function getGameByJoinCode(
   };
 }
 
+async function parsePushTestRequest(
+  request: Request,
+): Promise<{ readonly joinCode: string; readonly endpoint: string } | null> {
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return null;
+  }
+
+  const joinCode = typeof body === 'object' && body !== null && 'joinCode' in body
+    ? String(body.joinCode).trim().toUpperCase()
+    : '';
+
+  if (
+    !isPlainObject(body) ||
+    typeof body.joinCode !== 'string' ||
+    typeof body.endpoint !== 'string' ||
+    !isValidJoinCode(joinCode)
+  ) {
+    return null;
+  }
+
+  try {
+    const endpoint = new URL(body.endpoint);
+    if (endpoint.protocol !== 'https:') {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  return {
+    joinCode,
+    endpoint: body.endpoint,
+  };
+}
+
 async function getGameById(db: D1Database, id: string): Promise<StoredGame | null> {
   const row = await db
     .prepare(
@@ -910,7 +1015,8 @@ async function getGameById(db: D1Database, id: string): Promise<StoredGame | nul
               last_move_version, last_move_player, last_move_placed_index,
               last_move_flipped_indices_json, black_player_name, white_player_name,
               ended_reason, forfeited_by, rematch_game_id,
-              rematch_requested_by, rematch_requested_at
+              rematch_requested_by, rematch_requested_at,
+              current_turn_started_at, last_turn_reminder_sent_at
        FROM games
        WHERE id = ?`,
     )
@@ -989,8 +1095,8 @@ async function insertGame(
           last_move_version, last_move_player, last_move_placed_index,
           last_move_flipped_indices_json, black_player_name, white_player_name,
           ended_reason, forfeited_by, rematch_game_id, rematch_requested_by,
-          rematch_requested_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          rematch_requested_at, current_turn_started_at, last_turn_reminder_sent_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         id,
@@ -1028,6 +1134,8 @@ async function insertGame(
         null,
         null,
         null,
+        null,
+        fields.status === 'playing' ? now : null,
         null,
       )
       .run();
@@ -1197,6 +1305,8 @@ async function claimWhite(
            white_invite_claimed_at = ?,
            white_player_created_at = ?,
            white_player_name = ?,
+           current_turn_started_at = ?,
+           last_turn_reminder_sent_at = NULL,
            updated_at = ?
        WHERE id = ? AND join_code = ? AND white_joined = 0
          AND white_invite_token_digest = ?`,
@@ -1207,6 +1317,7 @@ async function claimWhite(
       now,
       now,
       displayName ?? null,
+      now,
       now,
       game.id,
       game.joinCode,
@@ -1235,6 +1346,8 @@ async function claimBlack(
            black_invite_claimed_at = ?,
            black_player_created_at = ?,
            black_player_name = ?,
+           current_turn_started_at = ?,
+           last_turn_reminder_sent_at = NULL,
            updated_at = ?
        WHERE id = ? AND join_code = ? AND black_joined = 0
          AND black_invite_token_digest = ?`,
@@ -1245,6 +1358,7 @@ async function claimBlack(
       now,
       now,
       displayName ?? null,
+      now,
       now,
       game.id,
       game.joinCode,
@@ -1365,7 +1479,7 @@ export function deriveNotificationEvent({
       eventType: 'your_turn',
       recipientPlayerColor: updatedGame.state.currentPlayer,
       title: 'Your turn in Othello',
-      body: 'Your opponent made a move.',
+      body: "It's your turn!",
     };
   }
 
@@ -1451,6 +1565,22 @@ async function listPushSubscriptions(
   return result.results ?? [];
 }
 
+async function findPushSubscription(
+  db: D1Database,
+  gameId: string,
+  playerColor: Player,
+  endpoint: string,
+): Promise<PushSubscriptionRow | null> {
+  return db
+    .prepare(
+      `SELECT id, endpoint, p256dh, auth
+       FROM push_subscriptions
+       WHERE game_id = ? AND player_color = ? AND endpoint = ?`,
+    )
+    .bind(gameId, playerColor, endpoint)
+    .first<PushSubscriptionRow>();
+}
+
 async function updateNotificationDeliveryState(
   db: D1Database,
   eventId: string,
@@ -1493,6 +1623,26 @@ export async function sendNotificationEvent(
     return;
   }
 
+  const result = await deliverNotificationToSubscriptions(db, env, game, notification);
+  await updateNotificationDeliveryState(
+    db,
+    eventId,
+    result.didSend ? 'sent' : 'failed',
+    Math.min(MAX_NOTIFICATION_ATTEMPTS, 1),
+    result.didSend ? null : result.lastError,
+  );
+}
+
+async function deliverNotificationToSubscriptions(
+  db: D1Database,
+  env: WorkerEnv,
+  game: StoredGame,
+  notification: NotificationEvent,
+): Promise<{ readonly didSend: boolean; readonly lastError: string | null }> {
+  if (!isPushConfigured(env)) {
+    return { didSend: false, lastError: 'Push notifications are not configured' };
+  }
+
   const subscriptions = await listPushSubscriptions(
     db,
     game.id,
@@ -1500,72 +1650,334 @@ export async function sendNotificationEvent(
   );
 
   if (subscriptions.length === 0) {
-    await updateNotificationDeliveryState(db, eventId, 'failed', 1, 'No subscriptions');
-    return;
+    return { didSend: false, lastError: 'No subscriptions' };
   }
 
   let didSend = false;
   let lastError: string | null = null;
 
   for (const subscription of subscriptions) {
-    try {
-      const request = await buildPushHTTPRequest({
-        privateJWK: env.VAPID_PRIVATE_KEY!,
-        subscription: {
-          endpoint: subscription.endpoint,
-          keys: {
-            p256dh: subscription.p256dh,
-            auth: subscription.auth,
-          },
-        } satisfies WebPushSubscription,
-        message: {
-          payload: {
-            title: notification.title,
-            body: notification.body,
-            icon: '/pwa-icon-192.png',
-            badge: '/pwa-icon-192.png',
-            tag: `${game.id}-${game.version}-${notification.eventType}`,
-            data: {
-              url: `/?game=${encodeURIComponent(game.joinCode)}`,
-              joinCode: game.joinCode,
-            },
-          },
-          adminContact: env.VAPID_SUBJECT!,
-          options: {
-            ttl: 60 * 60,
-            urgency: 'normal',
-            topic: `${game.id}-${game.version}-${notification.eventType}`,
-          },
-        },
-      });
+    const attempt = await deliverNotificationToSubscription(db, env, game, notification, subscription);
+    console.log('Push delivery result', {
+      eventType: notification.eventType,
+      provider: attempt.provider,
+      success: attempt.success,
+      httpStatus: attempt.httpStatus,
+      permanentFailure: attempt.permanentFailure,
+      temporaryFailure: attempt.temporaryFailure,
+      error: attempt.error,
+    });
 
-      const response = await fetch(request.endpoint, {
-        method: 'POST',
-        headers: request.headers,
-        body: request.body,
-      });
-
-      if (response.ok || response.status === 201 || response.status === 202) {
-        didSend = true;
-        continue;
-      }
-
-      lastError = `Push service returned ${response.status}`;
-      if (response.status === 404 || response.status === 410) {
-        await removePermanentPushFailure(db, subscription.id);
-      }
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : 'Push delivery failed';
+    if (attempt.success) {
+      didSend = true;
+    } else {
+      lastError = attempt.error ?? (
+        attempt.httpStatus ? `Push service returned ${attempt.httpStatus}` : 'Push delivery failed'
+      );
     }
   }
 
-  await updateNotificationDeliveryState(
-    db,
-    eventId,
-    didSend ? 'sent' : 'failed',
-    Math.min(MAX_NOTIFICATION_ATTEMPTS, 1),
-    didSend ? null : lastError,
+  return { didSend, lastError };
+}
+
+async function deliverNotificationToSubscription(
+  db: D1Database,
+  env: WorkerEnv,
+  game: StoredGame,
+  notification: NotificationEvent,
+  subscription: PushSubscriptionRow,
+): Promise<PushDeliveryAttempt> {
+  const provider = classifyPushProvider(subscription.endpoint);
+
+  if (!isPushConfigured(env)) {
+    return {
+      provider,
+      success: false,
+      httpStatus: null,
+      permanentFailure: false,
+      temporaryFailure: true,
+      error: 'Push notifications are not configured',
+    };
+  }
+
+  try {
+    const request = await buildPushHTTPRequest({
+      privateJWK: env.VAPID_PRIVATE_KEY!,
+      subscription: {
+        endpoint: subscription.endpoint,
+        keys: {
+          p256dh: subscription.p256dh,
+          auth: subscription.auth,
+        },
+      } satisfies WebPushSubscription,
+      message: {
+        payload: {
+          title: notification.title,
+          body: notification.body,
+          icon: '/pwa-icon-192.png',
+          badge: '/pwa-icon-192.png',
+          tag: `${game.id}-${game.version}-${notification.eventType}`,
+          data: {
+            url: `/?game=${encodeURIComponent(game.joinCode)}`,
+            joinCode: game.joinCode,
+          },
+        },
+        adminContact: env.VAPID_SUBJECT!,
+        options: {
+          ttl: 60 * 60,
+          urgency: 'normal',
+          topic: `${game.id}-${game.version}-${notification.eventType}`,
+        },
+      },
+    });
+
+    const response = await fetch(request.endpoint, {
+      method: 'POST',
+      headers: request.headers,
+      body: request.body,
+    });
+
+    if (response.ok || response.status === 201 || response.status === 202) {
+      return {
+        provider,
+        success: true,
+        httpStatus: response.status,
+        permanentFailure: false,
+        temporaryFailure: false,
+        error: null,
+      };
+    }
+
+    const permanentFailure = response.status === 404 || response.status === 410;
+    if (permanentFailure) {
+      await removePermanentPushFailure(db, subscription.id);
+    }
+
+    return {
+      provider,
+      success: false,
+      httpStatus: response.status,
+      permanentFailure,
+      temporaryFailure: !permanentFailure,
+      error: `Push service returned ${response.status}`,
+    };
+  } catch (error) {
+    return {
+      provider,
+      success: false,
+      httpStatus: null,
+      permanentFailure: false,
+      temporaryFailure: true,
+      error: sanitizePushError(error),
+    };
+  }
+}
+
+export function isTurnReminderDue({
+  turnStartedAt,
+  lastReminderSentAt,
+  now,
+}: {
+  readonly turnStartedAt: string | null;
+  readonly lastReminderSentAt: string | null;
+  readonly now: Date;
+}): boolean {
+  if (!turnStartedAt) {
+    return false;
+  }
+
+  const turnStartedTime = Date.parse(turnStartedAt);
+  const nowTime = now.getTime();
+  if (Number.isNaN(turnStartedTime) || turnStartedTime > nowTime) {
+    return false;
+  }
+
+  const lastReminderTime = lastReminderSentAt ? Date.parse(lastReminderSentAt) : null;
+  if (lastReminderTime !== null && Number.isNaN(lastReminderTime)) {
+    return false;
+  }
+
+  const elapsedSinceTurnStarted = nowTime - turnStartedTime;
+  const reminderInterval =
+    elapsedSinceTurnStarted <= FIRST_DAY_MS
+      ? FIRST_DAY_REMINDER_INTERVAL_MS
+      : LATER_REMINDER_INTERVAL_MS;
+  const elapsedSinceLastReminder =
+    nowTime - (lastReminderTime ?? turnStartedTime);
+
+  return (
+    elapsedSinceTurnStarted >= FIRST_DAY_REMINDER_INTERVAL_MS &&
+    elapsedSinceLastReminder >= reminderInterval
   );
+}
+
+async function listTurnReminderCandidates(db: D1Database): Promise<StoredGame[]> {
+  const result = await db
+    .prepare(
+      `SELECT id, join_code, board_json, current_player, status, winner,
+              black_score, white_score, consecutive_passes, version,
+              created_at, updated_at, black_player_token_digest,
+              white_player_token_digest, white_invite_token_digest,
+              white_joined, black_player_created_at, white_invite_created_at,
+              white_invite_claimed_at, white_player_created_at,
+              rematch_of_game_id, black_joined, black_invite_token_digest,
+              black_invite_created_at, black_invite_claimed_at,
+              last_move_version, last_move_player, last_move_placed_index,
+              last_move_flipped_indices_json, black_player_name, white_player_name,
+              ended_reason, forfeited_by, rematch_game_id,
+              rematch_requested_by, rematch_requested_at,
+              current_turn_started_at, last_turn_reminder_sent_at
+       FROM games
+       WHERE status = ? AND black_joined = 1 AND white_joined = 1
+         AND current_turn_started_at IS NOT NULL
+       ORDER BY current_turn_started_at ASC
+       LIMIT ?`,
+    )
+    .bind('playing', MAX_TURN_REMINDERS_PER_RUN)
+    .all<ReminderCandidateRow>();
+
+  return (result.results ?? [])
+    .map(rowToStoredGame)
+    .filter((game): game is StoredGame => game !== null);
+}
+
+async function claimTurnReminder(
+  db: D1Database,
+  game: StoredGame,
+  reminderSentAt: string,
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `UPDATE games
+       SET last_turn_reminder_sent_at = ?,
+           updated_at = updated_at
+       WHERE id = ? AND join_code = ? AND version = ? AND status = ?
+         AND current_player = ? AND current_turn_started_at = ?
+         AND (
+           (last_turn_reminder_sent_at IS NULL AND ? IS NULL)
+           OR last_turn_reminder_sent_at = ?
+         )`,
+    )
+    .bind(
+      reminderSentAt,
+      game.id,
+      game.joinCode,
+      game.version,
+      'playing',
+      game.state.currentPlayer,
+      game.currentTurnStartedAt ?? null,
+      game.lastTurnReminderSentAt ?? null,
+      game.lastTurnReminderSentAt ?? null,
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+async function restoreTurnReminderClaim(
+  db: D1Database,
+  game: StoredGame,
+  claimedReminderSentAt: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE games
+       SET last_turn_reminder_sent_at = ?
+       WHERE id = ? AND join_code = ? AND version = ? AND status = ?
+         AND current_player = ? AND current_turn_started_at = ?
+         AND last_turn_reminder_sent_at = ?`,
+    )
+    .bind(
+      game.lastTurnReminderSentAt ?? null,
+      game.id,
+      game.joinCode,
+      game.version,
+      'playing',
+      game.state.currentPlayer,
+      game.currentTurnStartedAt ?? null,
+      claimedReminderSentAt,
+    )
+    .run();
+}
+
+async function markCurrentTurnSeen(
+  db: D1Database,
+  game: StoredGame,
+  playerColor: Player,
+): Promise<void> {
+  if (
+    game.state.status !== 'playing' ||
+    !game.blackJoined ||
+    !game.whiteJoined ||
+    game.state.currentPlayer !== playerColor
+  ) {
+    return;
+  }
+
+  await db
+    .prepare(
+      `UPDATE games
+       SET last_turn_reminder_sent_at = ?
+       WHERE id = ? AND join_code = ? AND version = ? AND status = ?
+         AND current_player = ?`,
+    )
+    .bind(
+      new Date().toISOString(),
+      game.id,
+      game.joinCode,
+      game.version,
+      'playing',
+      playerColor,
+    )
+    .run();
+}
+
+export async function sendDueTurnReminders(
+  db: D1Database,
+  env: WorkerEnv,
+  now = new Date(),
+): Promise<number> {
+  const candidates = await listTurnReminderCandidates(db);
+  let sentCount = 0;
+
+  for (const game of candidates) {
+    try {
+      if (
+        !isTurnReminderDue({
+          turnStartedAt: game.currentTurnStartedAt ?? null,
+          lastReminderSentAt: game.lastTurnReminderSentAt ?? null,
+          now,
+        })
+      ) {
+        continue;
+      }
+
+      const reminderSentAt = now.toISOString();
+      const didClaim = await claimTurnReminder(db, game, reminderSentAt);
+      if (!didClaim) {
+        continue;
+      }
+
+      const result = await deliverNotificationToSubscriptions(db, env, game, {
+        eventType: 'turn_reminder',
+        recipientPlayerColor: game.state.currentPlayer,
+        title: 'Still your turn',
+        body: 'Still your turn.',
+      });
+      if (result.didSend) {
+        sentCount += 1;
+      } else {
+        await restoreTurnReminderClaim(db, game, reminderSentAt);
+      }
+    } catch (error) {
+      console.error('Turn reminder failed', {
+        gameId: game.id,
+        error: error instanceof Error ? error.message : 'Unknown reminder error',
+      });
+    }
+  }
+
+  return sentCount;
 }
 
 async function persistMove(
@@ -1577,6 +1989,12 @@ async function persistMove(
   const fields = gameStateToStorageFields(nextState);
   const updatedAt = new Date().toISOString();
   const nextVersion = game.version + 1;
+  const currentTurnStartedAt =
+    fields.status !== 'playing'
+      ? null
+      : fields.currentPlayer === game.state.currentPlayer
+        ? game.currentTurnStartedAt ?? updatedAt
+        : updatedAt;
 
   const result = await db
     .prepare(
@@ -1593,6 +2011,8 @@ async function persistMove(
            last_move_player = ?,
            last_move_placed_index = ?,
            last_move_flipped_indices_json = ?,
+           current_turn_started_at = ?,
+           last_turn_reminder_sent_at = NULL,
            updated_at = ?
        WHERE id = ? AND join_code = ? AND version = ?`,
     )
@@ -1609,6 +2029,7 @@ async function persistMove(
       lastMove?.player ?? null,
       lastMove?.placedIndex ?? null,
       lastMove ? JSON.stringify(lastMove.flippedIndices) : null,
+      currentTurnStartedAt,
       updatedAt,
       game.id,
       game.joinCode,
@@ -2047,6 +2468,8 @@ async function persistForfeit(
            last_move_player = NULL,
            last_move_placed_index = NULL,
            last_move_flipped_indices_json = NULL,
+           current_turn_started_at = NULL,
+           last_turn_reminder_sent_at = NULL,
            updated_at = ?
        WHERE id = ? AND join_code = ? AND status = ? AND version = ?`,
     )
@@ -2086,6 +2509,8 @@ async function persistCancellation(
            last_move_player = NULL,
            last_move_placed_index = NULL,
            last_move_flipped_indices_json = NULL,
+           current_turn_started_at = NULL,
+           last_turn_reminder_sent_at = NULL,
            updated_at = ?
        WHERE id = ? AND join_code = ? AND status = ? AND version = ?
          AND black_joined = 1 AND white_joined = 0`,
@@ -2136,6 +2561,20 @@ async function handlePlayerProfile(
   }
 
   return jsonResponse(toGameRecord(updatedGame, authResult.playerColor));
+}
+
+async function handleTurnSeen(
+  request: Request,
+  db: D1Database,
+  joinCode: string,
+): Promise<Response> {
+  const authResult = await authenticateGame(request, db, joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  await markCurrentTurnSeen(db, authResult.game, authResult.playerColor);
+  return jsonResponse({ ok: true });
 }
 
 async function handleSkipToEnd(
@@ -2229,6 +2668,52 @@ async function handleUnsubscribe(
   return jsonResponse({ enabled: false });
 }
 
+async function handlePushTest(
+  request: Request,
+  db: D1Database,
+  env: WorkerEnv,
+): Promise<Response> {
+  if (!isPushConfigured(env)) {
+    return errorResponse(503, 'Push notifications are not configured');
+  }
+
+  const testRequest = await parsePushTestRequest(request);
+  if (!testRequest) {
+    return errorResponse(400, 'Malformed push test request');
+  }
+
+  const authResult = await authenticateGame(request, db, testRequest.joinCode);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  const subscription = await findPushSubscription(
+    db,
+    authResult.game.id,
+    authResult.playerColor,
+    testRequest.endpoint,
+  );
+  if (!subscription) {
+    return errorResponse(404, 'Push subscription is not registered for this game');
+  }
+
+  const attempt = await deliverNotificationToSubscription(db, env, authResult.game, {
+    eventType: 'turn_reminder',
+    recipientPlayerColor: authResult.playerColor,
+    title: 'Othello notification test',
+    body: 'Notifications are working on this device.',
+  }, subscription);
+
+  return jsonResponse({
+    success: attempt.success,
+    provider: attempt.provider,
+    httpStatus: attempt.httpStatus,
+    permanentFailure: attempt.permanentFailure,
+    temporaryFailure: attempt.temporaryFailure,
+    error: attempt.error,
+  }, { status: attempt.success ? 200 : 502 });
+}
+
 function parseGamePath(pathname: string):
   | {
       readonly code: string;
@@ -2241,10 +2726,11 @@ function parseGamePath(pathname: string):
         | 'forfeit'
         | 'cancel'
         | 'skip-to-end'
-        | 'player-profile';
+        | 'player-profile'
+        | 'turn-seen';
     }
   | null {
-  const match = /^\/api\/games\/([^/]+)(?:\/(moves|join|push-subscriptions|rematch|forfeit|cancel|test\/skip-to-end|player-profile))?$/.exec(pathname);
+  const match = /^\/api\/games\/([^/]+)(?:\/(moves|join|push-subscriptions|rematch|forfeit|cancel|test\/skip-to-end|player-profile|turn-seen))?$/.exec(pathname);
   if (!match) {
     return null;
   }
@@ -2269,7 +2755,9 @@ function parseGamePath(pathname: string):
                     ? 'skip-to-end'
                     : suffix === 'player-profile'
                       ? 'player-profile'
-                      : 'read',
+                      : suffix === 'turn-seen'
+                        ? 'turn-seen'
+                        : 'read',
   };
 }
 
@@ -2284,6 +2772,10 @@ async function routeApiRequest(
       enabled: isPushConfigured(env),
       publicKey: env.VAPID_PUBLIC_KEY ?? null,
     });
+  }
+
+  if (url.pathname === '/api/push/test' && request.method === 'POST') {
+    return handlePushTest(request, env.DB, env);
   }
 
   if (url.pathname === '/api/test-controls' && request.method === 'GET') {
@@ -2361,6 +2853,10 @@ async function routeApiRequest(
     return handlePlayerProfile(request, env.DB, gamePath.code);
   }
 
+  if (gamePath?.action === 'turn-seen' && request.method === 'POST') {
+    return handleTurnSeen(request, env.DB, gamePath.code);
+  }
+
   if (gamePath?.action === 'skip-to-end' && request.method === 'POST') {
     return handleSkipToEnd(request, env.DB, env, gamePath.code);
   }
@@ -2377,5 +2873,8 @@ export default {
     }
 
     return new Response(null, { status: 404 });
+  },
+  async scheduled(_controller, env) {
+    await sendDueTurnReminders(env.DB, env);
   },
 } satisfies ExportedHandler<WorkerEnv>;
